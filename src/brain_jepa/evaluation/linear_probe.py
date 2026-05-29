@@ -1,9 +1,4 @@
-"""Linear probe evaluation on frozen BS-JEPA representations.
-
-Representations are obtained by passing each subject through the
-context encoder with no masking (all subnetworks visible) and then
-mean-pooling all subnetwork tokens into a single subject-level vector.
-"""
+"""Linear probe evaluation on frozen BS-JEPA representations."""
 
 from __future__ import annotations
 
@@ -23,38 +18,31 @@ def extract_representations(
     model: BSJEPA,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the context encoder (all nodes visible) and pool to one vector per subject.
+) -> tuple[torch.Tensor, list[str]]:
+    """Run the target encoder (full graph) and mean-pool to one vector per subject.
 
     Returns:
-        features: (N_samples, d) representation tensor.
-        labels: (N_samples,) label tensor (if loader provides them).
+        features:    (N_subjects, d) representation tensor.
+        subject_ids: list of subject ID strings, length N_subjects.
     """
     model.eval()
     features_list: list[torch.Tensor] = []
-    labels_list: list[torch.Tensor] = []
+    subject_ids: list[str] = []
 
     for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            graphs, labels = batch
-            labels_list.append(labels)
-        else:
-            graphs = batch
-
+        graphs = batch[0] if isinstance(batch, (list, tuple)) else batch
         data_list = graphs.to_data_list() if hasattr(graphs, "to_data_list") else [graphs]
         for data in data_list:
             data = data.to(device)
-            node_emb = model.context_encoder(data)    # (N, d)
-            subj_repr = node_emb.mean(dim=0)          # (d,)
-            features_list.append(subj_repr.cpu())
+            node_emb = model.target_encoder(data)   # (N, d) — full graph
+            features_list.append(node_emb.mean(dim=0).cpu())
+            subject_ids.append(str(getattr(data, "subject_id", "")))
 
-    features = torch.stack(features_list)
-    labels = torch.cat(labels_list) if labels_list else torch.zeros(len(features), dtype=torch.long)
-    return features, labels
+    return torch.stack(features_list), subject_ids
 
 
 class LinearProbe(nn.Module):
-    """Single linear classifier on top of frozen representations.
+    """Linear classifier for categorical labels (e.g. gender, diagnosis).
 
     Args:
         in_features: Representation dimensionality.
@@ -77,17 +65,12 @@ class LinearProbe(nn.Module):
         weight_decay: float = 1e-4,
         device: torch.device | None = None,
     ) -> list[float]:
-        """Train the linear probe on pre-extracted features.
-
-        Returns a list of per-epoch training losses.
-        """
         if device:
             self.to(device)
             features = features.to(device)
             labels = labels.to(device)
 
-        dataset = TensorDataset(features, labels)
-        loader = DataLoader(dataset, batch_size=256, shuffle=True)
+        loader = DataLoader(TensorDataset(features, labels), batch_size=256, shuffle=True)
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss()
         losses: list[float] = []
@@ -97,23 +80,89 @@ class LinearProbe(nn.Module):
             epoch_loss = 0.0
             for x_batch, y_batch in loader:
                 optimizer.zero_grad()
-                logits = self(x_batch)
-                loss = criterion(logits, y_batch)
+                loss = criterion(self(x_batch), y_batch)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
             losses.append(epoch_loss / len(loader))
             if (epoch + 1) % 10 == 0:
-                logger.info("Linear probe epoch %d | loss=%.4f", epoch + 1, losses[-1])
+                logger.info("LinearProbe epoch %d | loss=%.4f", epoch + 1, losses[-1])
         return losses
 
     @torch.no_grad()
-    def evaluate(
-        self, features: torch.Tensor, labels: torch.Tensor
-    ) -> dict[str, float]:
-        """Return accuracy on the provided features/labels."""
+    def evaluate(self, features: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
         self.eval()
-        logits = self(features)
-        preds = logits.argmax(dim=1)
+        preds = self(features).argmax(dim=1)
         acc = (preds == labels).float().mean().item()
         return {"accuracy": acc}
+
+
+class RegressionProbe(nn.Module):
+    """Linear regression probe for continuous labels (e.g. PMAT score, age).
+
+    Args:
+        in_features: Representation dimensionality.
+    """
+
+    def __init__(self, in_features: int) -> None:
+        super().__init__()
+        self.fc = nn.Linear(in_features, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x).squeeze(-1)  # (B,)
+
+    def fit(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        num_epochs: int = 100,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        device: torch.device | None = None,
+    ) -> list[float]:
+        if device:
+            self.to(device)
+            features = features.to(device)
+            labels = labels.to(device)
+
+        loader = DataLoader(TensorDataset(features, labels), batch_size=256, shuffle=True)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
+        criterion = nn.MSELoss()
+        losses: list[float] = []
+
+        self.train()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for x_batch, y_batch in loader:
+                optimizer.zero_grad()
+                loss = criterion(self(x_batch), y_batch.float())
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            losses.append(epoch_loss / len(loader))
+            if (epoch + 1) % 10 == 0:
+                logger.info("RegressionProbe epoch %d | mse=%.4f", epoch + 1, losses[-1])
+        return losses
+
+    @torch.no_grad()
+    def evaluate(self, features: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
+        """Return MSE, MAE, R² and Pearson r on the provided features/labels."""
+        self.eval()
+        preds = self(features)
+        labels = labels.float()
+
+        mse = nn.functional.mse_loss(preds, labels).item()
+        mae = (preds - labels).abs().mean().item()
+
+        # R² = 1 - SS_res / SS_tot
+        ss_res = ((labels - preds) ** 2).sum()
+        ss_tot = ((labels - labels.mean()) ** 2).sum()
+        r2 = (1 - ss_res / ss_tot).item() if ss_tot > 0 else 0.0
+
+        # Pearson r
+        vx = preds - preds.mean()
+        vy = labels - labels.mean()
+        denom = (vx.norm() * vy.norm())
+        pearson_r = (vx @ vy / denom).item() if denom > 0 else 0.0
+
+        return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": pearson_r}

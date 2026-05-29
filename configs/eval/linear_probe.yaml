@@ -2,24 +2,30 @@ meta:
   seed: 42
 
 data:
-  atlas_csv: data/atlas/glasser379_to_rsn12.csv
-  subject_dir: data/subjects
-  label_csv: data/labels.csv     # columns: subject_id, label
+  atlas_csv: /content/drive/MyDrive/IMPERIAL/data/glasser379_to_rsn12.csv
+  dict_file: /content/drive/MyDrive/IMPERIAL/data/subject_data_1_cleaned_precise_age.pkl                        # path to your .pkl subject dict
+  feature_mode: conv1d               # must match what was used during pretraining
+  feature_dim: 64
+  bold_key: BOLD
+  fc_key: FC
+  transpose_bold: false
   fc_strategy: top_k
   top_k: 10
   batch_size: 32
   num_workers: 4
+  label_csv: /content/drive/MyDrive/IMPERIAL/data/HCP_YA_subjects_2026_04_02_12_52_45.csv                    # path to CSV with PMAT scores
+  label_col: PMAT24_A_CR             # column to predict
+  subject_col: Subject               # column with subject IDs
 
 model:
-  checkpoint: outputs/pretrain/ckpt_latest.pt
-  encoder_type: gcn
+  checkpoint: /content/drive/MyDrive/IMPERIAL/brain_jepa_subnetworks/ckpt_epoch0030.pt
+  encoder_type: gcn                  # must match pretraining config
   encoder_hidden: 256
   encoder_out: 512
   encoder_layers: 4
 
 probe:
-  num_classes: 2
-  num_epochs: 100
+  num_epochs: 200
   lr: 1.0e-3
   weight_decay: 1.0e-4
 
