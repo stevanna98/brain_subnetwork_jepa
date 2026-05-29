@@ -1,0 +1,19 @@
+defaults:
+  - default
+
+model:
+  encoder_type: graph_transformer
+  encoder_hidden: 256
+  encoder_out: 512
+  encoder_layers: 4
+  encoder_heads: 4
+  encoder_dropout: 0.1
+  pooling_mode: attention
+  predictor_dim: 384
+  predictor_depth: 8
+  predictor_heads: 6
+
+training:
+  num_epochs: 200
+  lr: 5.0e-4
+  warmup_epochs: 20

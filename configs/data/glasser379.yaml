@@ -1,0 +1,11 @@
+atlas:
+  csv_path: data/atlas/glasser379_to_rsn12.csv
+  num_regions: 379
+  num_rsns: 12
+
+# Expected .npz / .pt keys per subject file:
+#   X           : (379, F)   pre-computed node features         [optional]
+#   time_series : (379, T)   region-level BOLD time series      [optional]
+#   metadata    : dict       e.g. {"subject_id": "HCP_100307"}  [optional]
+#
+# At least one of X or time_series must be present.

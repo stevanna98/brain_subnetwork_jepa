@@ -1,0 +1,50 @@
+meta:
+  seed: 42
+  output_dir: outputs/pretrain
+
+data:
+  atlas_csv: data/atlas/glasser379_to_rsn12.csv
+  subject_dir: data/subjects
+  feature_mode: passthrough   # passthrough | conv1d | transformer
+  feature_dim: 64
+  fc_strategy: top_k          # dense | top_k | absolute_threshold | fisher_z_then_threshold
+  top_k: 10
+  threshold: 0.2
+  batch_size: 16
+  num_workers: 4
+  synthetic: false
+  num_synthetic_subjects: 64
+
+masking:
+  num_targets: 1              # M — number of held-out subnetworks per sample
+  include_cross_edges: false
+
+model:
+  encoder_type: gcn           # gcn | graph_transformer
+  encoder_hidden: 256
+  encoder_out: 512
+  encoder_layers: 4
+  encoder_heads: 4            # used only for graph_transformer
+  encoder_dropout: 0.0
+  pooling_mode: mean          # mean | attention
+  predictor_dim: 384
+  predictor_depth: 6
+  predictor_heads: 6
+  predictor_dropout: 0.0
+
+training:
+  num_epochs: 100
+  lr: 1.0e-3
+  start_lr: 1.0e-5
+  final_lr: 1.0e-6
+  warmup_epochs: 10
+  weight_decay_start: 0.04
+  weight_decay_end: 0.4
+  clip_grad: 1.0
+  ema_tau_start: 0.996
+  ema_tau_end: 1.0
+
+logging:
+  log_freq: 10
+  checkpoint_freq: 10
+  wandb_project: null         # set to a string to enable W&B

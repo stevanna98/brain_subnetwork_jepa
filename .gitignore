@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Data
+data/subjects/
+outputs/
+*.npz
+*.pt
+!configs/**/*.pt
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# W&B
+wandb/

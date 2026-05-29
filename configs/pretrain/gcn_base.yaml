@@ -1,0 +1,17 @@
+defaults:
+  - default
+
+model:
+  encoder_type: gcn
+  encoder_hidden: 256
+  encoder_out: 512
+  encoder_layers: 4
+  encoder_dropout: 0.1
+  pooling_mode: mean
+  predictor_dim: 384
+  predictor_depth: 6
+
+training:
+  num_epochs: 200
+  lr: 1.0e-3
+  warmup_epochs: 20

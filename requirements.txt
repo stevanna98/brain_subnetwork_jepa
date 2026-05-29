@@ -1,0 +1,15 @@
+# Core
+torch>=2.1
+# PyG requires matching torch + CUDA wheels — see installation note in README
+torch-geometric>=2.4
+numpy>=1.24
+omegaconf>=2.3
+scipy>=1.11
+
+# Dev / test
+pytest>=7.4
+ruff>=0.4
+mypy>=1.8
+
+# Optional
+wandb>=0.16
