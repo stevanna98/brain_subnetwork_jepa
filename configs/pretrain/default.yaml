@@ -55,5 +55,5 @@ training:
 logging:
   log_freq: 10
   checkpoint_freq: 10
-  plot_dir: outputs/pretrain/plots  # folder for loss.png and tau.png; overwritten each epoch
+  plot_dir: /content/drive/MyDrive/IMPERIAL/brain_jepa_subnetworks/   # folder for loss.png and tau.png; overwritten each epoch
   wandb_project: null         # set to a string to enable W&B
