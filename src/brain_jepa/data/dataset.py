@@ -64,7 +64,7 @@ class BrainDataset(Dataset):
         if self._feature_module is None:
             # Deterministic seed so workers that fork after this point all
             # produce identical weights; avoids per-worker random divergence.
-            with torch.random.fork_rng():
+            with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
                 self._feature_module = build_feature_module(
                     self.feature_mode, in_channels, self.feature_dim
@@ -189,7 +189,7 @@ class FCDictDataset(Dataset):
 
     def _get_feature_module(self, in_channels: int) -> torch.nn.Module:
         if self._feature_module is None:
-            with torch.random.fork_rng():
+            with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
                 self._feature_module = build_feature_module(
                     self.feature_mode, in_channels, self.feature_dim
