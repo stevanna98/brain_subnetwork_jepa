@@ -3,17 +3,25 @@ meta:
   output_dir: outputs/pretrain
 
 data:
-  atlas_csv: data/atlas/glasser379_to_rsn12.csv
-  subject_dir: data/subjects
-  feature_mode: passthrough   # passthrough | conv1d | transformer
+  atlas_csv: /content/drive/MyDrive/IMPERIAL/data/glasser379_to_rsn12.csv
+  # --- source: pick one ---
+  dict_file: /content/drive/MyDrive/IMPERIAL/data/subject_data_1_cleaned_precise_age.pkl         # path to a .pt dict {subject_id: {BOLD, FC, age, gender}}
+  subject_dir: data/subjects  # used when dict_file is null and synthetic is false
+  synthetic: false
+  num_synthetic_subjects: 64
+  # --- features ---
+  feature_mode: conv1d   # passthrough | conv1d
   feature_dim: 64
+  bold_key: BOLD              # key for time-series inside each subject dict (FCDictDataset only)
+  fc_key: FC                  # key for FC matrix inside each subject dict (FCDictDataset only)
+  transpose_bold: false       # set true if BOLD is stored as (T, N) instead of (N, T)
+  # --- graph construction ---
   fc_strategy: top_k          # dense | top_k | absolute_threshold | fisher_z_then_threshold
   top_k: 10
   threshold: 0.2
+  # --- loader ---
   batch_size: 16
   num_workers: 4
-  synthetic: false
-  num_synthetic_subjects: 64
 
 masking:
   num_targets: 1              # M — number of held-out subnetworks per sample

@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 # Allow running from repo root without installing
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from brain_jepa.data import BrainDataset, SyntheticBrainDataset
+from brain_jepa.data import BrainDataset, FCDictDataset, SyntheticBrainDataset
 from brain_jepa.data.atlas import load_atlas
 from brain_jepa.masking import SubnetworkMaskCollator
 from brain_jepa.models import build_bsjepa
@@ -84,6 +84,20 @@ def main() -> None:
             seed=cfg.meta.seed,
         )
         logger.info("Using synthetic dataset (%d subjects)", len(dataset))
+    elif cfg.data.get("dict_file"):
+        dataset = FCDictDataset(
+            dict_path=Path(cfg.data.dict_file),
+            atlas=atlas,
+            feature_mode=cfg.data.feature_mode,
+            feature_dim=int(cfg.data.feature_dim),
+            fc_strategy=cfg.data.fc_strategy,
+            top_k=int(cfg.data.top_k),
+            threshold=float(cfg.data.threshold),
+            bold_key=cfg.data.get("bold_key", "BOLD"),
+            fc_key=cfg.data.get("fc_key", "FC"),
+            transpose_bold=bool(cfg.data.get("transpose_bold", False)),
+        )
+        logger.info("FCDictDataset: %d subjects from %s", len(dataset), cfg.data.dict_file)
     else:
         subject_dir = Path(cfg.data.subject_dir)
         subject_files = sorted(subject_dir.glob("*.npz")) + sorted(subject_dir.glob("*.pt"))

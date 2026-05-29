@@ -118,6 +118,103 @@ def _load_subject(path: Path) -> dict:
     raise ValueError(f"Unsupported file format: {path.suffix!r}. Use .npz or .pt")
 
 
+class FCDictDataset(Dataset):
+    """Dataset backed by a single .pt dictionary file.
+
+    Expected file structure (produced by ``torch.save``)::
+
+        {
+            "sub-001": {"BOLD": Tensor(N,T), "FC": Tensor(N,N), "gender": ..., "age": ...},
+            "sub-002": {...},
+            ...
+        }
+
+    The FC matrix is used directly for graph construction (no Pearson recomputation).
+    BOLD is passed through the feature module to produce (N, F) node features.
+
+    Args:
+        dict_path: Path to the .pt file.
+        atlas: Atlas with region-to-RSN mapping.
+        feature_mode: How to reduce BOLD to node features.
+        feature_dim: Output feature dimension F.
+        fc_strategy: Edge selection strategy applied to the FC matrix.
+        top_k: Used when fc_strategy="top_k".
+        threshold: Used for threshold-based strategies.
+        bold_key: Key for the time-series tensor in each subject dict.
+        fc_key: Key for the FC matrix in each subject dict.
+        transpose_bold: Set True if BOLD is stored as (T, N); it will be
+            transposed to (N, T) before feature extraction.
+    """
+
+    def __init__(
+        self,
+        dict_path: str | Path,
+        atlas: AtlasMapping,
+        feature_mode: FeatureMode = "passthrough",
+        feature_dim: int = 64,
+        fc_strategy: FCStrategy = "top_k",
+        top_k: int = 10,
+        threshold: float = 0.2,
+        bold_key: str = "BOLD",
+        fc_key: str = "FC",
+        transpose_bold: bool = False,
+    ) -> None:
+        self._data: dict = torch.load(Path(dict_path), map_location="cpu")
+        self._subject_ids: list = list(self._data.keys())
+        self.atlas = atlas
+        self.feature_mode = feature_mode
+        self.feature_dim = feature_dim
+        self.fc_strategy = fc_strategy
+        self.top_k = top_k
+        self.threshold = threshold
+        self.bold_key = bold_key
+        self.fc_key = fc_key
+        self.transpose_bold = transpose_bold
+        self._feature_module: torch.nn.Module | None = None
+
+    def _get_feature_module(self, in_channels: int) -> torch.nn.Module:
+        if self._feature_module is None:
+            with torch.random.fork_rng():
+                torch.manual_seed(0)
+                self._feature_module = build_feature_module(
+                    self.feature_mode, in_channels, self.feature_dim
+                )
+        return self._feature_module
+
+    def __len__(self) -> int:
+        return len(self._subject_ids)
+
+    def __getitem__(self, idx: int) -> Data:
+        subject_id = self._subject_ids[idx]
+        subject = self._data[subject_id]
+
+        fc = torch.as_tensor(subject[self.fc_key], dtype=torch.float32)
+        graph = build_graph(
+            fc,
+            strategy=self.fc_strategy,
+            top_k=self.top_k,
+            threshold=self.threshold,
+        )
+
+        bold = torch.as_tensor(subject[self.bold_key], dtype=torch.float32)
+        if self.transpose_bold:
+            bold = bold.T  # (T, N) → (N, T)
+        feat_module = self._get_feature_module(bold.shape[1])
+        with torch.no_grad():
+            x = feat_module(bold)  # (N, F)
+
+        graph.x = x
+        graph.rsn_ids = self.atlas.rsn_ids.clone()
+        graph.subject_id = str(subject_id)
+
+        if "age" in subject:
+            graph.age = float(subject["age"])
+        if "gender" in subject:
+            graph.gender = subject["gender"]
+
+        return graph
+
+
 class SyntheticBrainDataset(Dataset):
     """Generates synthetic brain graphs for smoke tests and development.
 
