@@ -1,7 +1,6 @@
 meta:
   seed: 42
-  output_dir: outputs/pretrain
-
+  output_dir: /content/drive/MyDrive/IMPERIAL/brain_jepa_subnetworks/
 data:
   atlas_csv: /content/drive/MyDrive/IMPERIAL/data/glasser379_to_rsn12.csv
   # --- source: pick one ---

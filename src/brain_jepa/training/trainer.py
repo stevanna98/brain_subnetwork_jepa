@@ -101,7 +101,8 @@ class Trainer:
 
             logger.info("Epoch %d | avg_loss=%.4f | tau=%.5f", epoch, avg_loss, tau)
 
-            if checkpoint_dir and epoch % checkpoint_freq == 0:
+            is_last = epoch == num_epochs
+            if checkpoint_dir and (epoch % checkpoint_freq == 0 or is_last):
                 self._save_checkpoint(checkpoint_dir / f"ckpt_epoch{epoch:04d}.pt", epoch, avg_loss)
 
             if plot_dir:
