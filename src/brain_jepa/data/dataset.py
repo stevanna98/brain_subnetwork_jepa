@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -109,6 +110,20 @@ class BrainDataset(Dataset):
         return graph
 
 
+def _load_dict_file(path: Path) -> dict:
+    """Load a subject-dictionary file regardless of format (.pkl, .pt, .npz)."""
+    if path.suffix == ".pkl":
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+    if path.suffix == ".pt":
+        # weights_only=False needed for dicts containing non-tensor objects
+        return torch.load(path, map_location="cpu", weights_only=False)
+    if path.suffix == ".npz":
+        raw = np.load(path, allow_pickle=True)
+        return {k: raw[k] for k in raw.files}
+    raise ValueError(f"Unsupported dict file format: {path.suffix!r}. Use .pkl, .pt, or .npz")
+
+
 def _load_subject(path: Path) -> dict:
     if path.suffix == ".npz":
         raw = np.load(path, allow_pickle=True)
@@ -159,7 +174,7 @@ class FCDictDataset(Dataset):
         fc_key: str = "FC",
         transpose_bold: bool = False,
     ) -> None:
-        self._data: dict = torch.load(Path(dict_path), map_location="cpu")
+        self._data: dict = _load_dict_file(Path(dict_path))
         self._subject_ids: list = list(self._data.keys())
         self.atlas = atlas
         self.feature_mode = feature_mode
