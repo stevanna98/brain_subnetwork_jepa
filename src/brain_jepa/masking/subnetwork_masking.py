@@ -125,11 +125,12 @@ def extract_subgraph(
         A new :class:`~torch_geometric.data.Data` with re-indexed nodes and
         an ``original_indices`` attribute mapping new → old node positions.
     """
+    device = node_mask.device
     original_indices = node_mask.nonzero(as_tuple=True)[0]
     x_sub = data.x[original_indices]
 
-    old_to_new = torch.full((data.num_nodes,), -1, dtype=torch.long)
-    old_to_new[original_indices] = torch.arange(len(original_indices))
+    old_to_new = torch.full((data.num_nodes,), -1, dtype=torch.long, device=device)
+    old_to_new[original_indices] = torch.arange(len(original_indices), device=device)
 
     src, dst = data.edge_index
     if include_cross_edges:
