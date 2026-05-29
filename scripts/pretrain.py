@@ -202,6 +202,7 @@ def main() -> None:
         num_epochs=int(cfg.training.num_epochs),
         checkpoint_dir=output_dir,
         checkpoint_freq=int(cfg.logging.checkpoint_freq),
+        plot_dir=Path(cfg.logging.plot_dir) if cfg.logging.get("plot_dir") else None,
     )
 
 

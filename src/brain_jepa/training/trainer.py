@@ -10,6 +10,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend, safe in all environments
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
+
 from ..masking.subnetwork_masking import SubnetworkMaskCollator
 from ..models.bs_jepa import BSJEPA
 from .ema import EMAUpdater
@@ -70,18 +78,34 @@ class Trainer:
         num_epochs: int,
         checkpoint_dir: Path | str | None = None,
         checkpoint_freq: int = 1,
+        plot_dir: Path | str | None = None,
     ) -> None:
         """Run the full pretraining loop."""
         checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         if checkpoint_dir:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        plot_dir = Path(plot_dir) if plot_dir else None
+        if plot_dir:
+            plot_dir.mkdir(parents=True, exist_ok=True)
+
+        epoch_losses: list[float] = []
+        epoch_taus: list[float] = []
+
         for epoch in range(1, num_epochs + 1):
             avg_loss = self._train_epoch(loader, epoch)
-            logger.info("Epoch %d | avg_loss=%.4f", epoch, avg_loss)
+            tau = self.ema_updater.current_tau
+
+            epoch_losses.append(avg_loss)
+            epoch_taus.append(tau)
+
+            logger.info("Epoch %d | avg_loss=%.4f | tau=%.5f", epoch, avg_loss, tau)
 
             if checkpoint_dir and epoch % checkpoint_freq == 0:
                 self._save_checkpoint(checkpoint_dir / f"ckpt_epoch{epoch:04d}.pt", epoch, avg_loss)
+
+            if plot_dir:
+                self._save_plots(plot_dir, epoch_losses, epoch_taus)
 
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
         self.model.train()
@@ -128,6 +152,40 @@ class Trainer:
                 )
 
         return total_loss / max(len(loader), 1)
+
+    def _save_plots(
+        self,
+        plot_dir: Path,
+        epoch_losses: list[float],
+        epoch_taus: list[float],
+    ) -> None:
+        if not _MATPLOTLIB_AVAILABLE:
+            logger.warning("matplotlib not installed — skipping plots.")
+            return
+
+        epochs = list(range(1, len(epoch_losses) + 1))
+
+        # Loss plot
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(epochs, epoch_losses, linewidth=1.5)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title("BS-JEPA pretraining loss")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "loss.png", dpi=120)
+        plt.close(fig)
+
+        # Tau plot
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(epochs, epoch_taus, color="darkorange", linewidth=1.5)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("EMA momentum τ")
+        ax.set_title("Target encoder EMA momentum")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "tau.png", dpi=120)
+        plt.close(fig)
 
     def _save_checkpoint(self, path: Path, epoch: int, loss: float) -> None:
         state = {
