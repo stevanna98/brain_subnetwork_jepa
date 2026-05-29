@@ -30,4 +30,4 @@ probe:
   weight_decay: 1.0e-4
 
 logging:
-  output_dir: outputs/eval
+  output_dir: /content/drive/MyDrive/IMPERIAL/brain_jepa_subnetworks/
