@@ -18,6 +18,7 @@ try:
 except ImportError:
     _MATPLOTLIB_AVAILABLE = False
 
+from ..evaluation.linear_probe import ProbeEvaluator
 from ..masking.subnetwork_masking import SubnetworkMaskCollator
 from ..models.bs_jepa import BSJEPA
 from .ema import EMAUpdater
@@ -44,6 +45,7 @@ class Trainer:
         device: Torch device.
         clip_grad: If set, max gradient norm for clipping.
         log_freq: Log every this many iterations.
+        probe_evaluator: If provided, evaluated every ``probe_freq`` epochs.
     """
 
     def __init__(
@@ -57,6 +59,7 @@ class Trainer:
         device: torch.device,
         clip_grad: float | None = 1.0,
         log_freq: int = 10,
+        probe_evaluator: ProbeEvaluator | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -67,6 +70,7 @@ class Trainer:
         self.device = device
         self.clip_grad = clip_grad
         self.log_freq = log_freq
+        self.probe_evaluator = probe_evaluator
 
     # ------------------------------------------------------------------
     # Public API
@@ -79,6 +83,7 @@ class Trainer:
         checkpoint_dir: Path | str | None = None,
         checkpoint_freq: int = 1,
         plot_dir: Path | str | None = None,
+        probe_freq: int = 10,
     ) -> None:
         """Run the full pretraining loop."""
         checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
@@ -91,6 +96,7 @@ class Trainer:
 
         epoch_losses: list[float] = []
         epoch_taus: list[float] = []
+        probe_history: list[dict] = []  # {epoch, **metrics}
 
         for epoch in range(1, num_epochs + 1):
             avg_loss = self._train_epoch(loader, epoch)
@@ -105,8 +111,14 @@ class Trainer:
             if checkpoint_dir and (epoch % checkpoint_freq == 0 or is_last):
                 self._save_checkpoint(checkpoint_dir / f"ckpt_epoch{epoch:04d}.pt", epoch, avg_loss)
 
+            if self.probe_evaluator is not None and (epoch % probe_freq == 0 or is_last):
+                logger.info("Running probe evaluation at epoch %d…", epoch)
+                metrics = self.probe_evaluator.evaluate(self.model)
+                probe_history.append({"epoch": epoch, **metrics})
+                self.model.train()  # restore train mode after probe eval
+
             if plot_dir:
-                self._save_plots(plot_dir, epoch_losses, epoch_taus)
+                self._save_plots(plot_dir, epoch_losses, epoch_taus, probe_history)
 
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
         self.model.train()
@@ -159,6 +171,7 @@ class Trainer:
         plot_dir: Path,
         epoch_losses: list[float],
         epoch_taus: list[float],
+        probe_history: list[dict] | None = None,
     ) -> None:
         if not _MATPLOTLIB_AVAILABLE:
             logger.warning("matplotlib not installed — skipping plots.")
@@ -186,6 +199,31 @@ class Trainer:
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(plot_dir / "tau.png", dpi=120)
+        plt.close(fig)
+
+        # Probe metrics plot
+        if not probe_history:
+            return
+        probe_epochs = [h["epoch"] for h in probe_history]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        if "age_r2" in probe_history[0]:
+            axes[0].plot(probe_epochs, [h["age_r2"] for h in probe_history],
+                         marker="o", linewidth=1.5, label="R²")
+            axes[0].plot(probe_epochs, [h["age_pearson_r"] for h in probe_history],
+                         marker="s", linewidth=1.5, linestyle="--", label="Pearson r")
+            axes[0].set_xlabel("Epoch")
+            axes[0].set_title("Age regression probe")
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+        if "gender_accuracy" in probe_history[0]:
+            axes[1].plot(probe_epochs, [h["gender_accuracy"] for h in probe_history],
+                         marker="o", color="green", linewidth=1.5)
+            axes[1].set_xlabel("Epoch")
+            axes[1].set_ylabel("Accuracy")
+            axes[1].set_title("Gender classification probe")
+            axes[1].grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "probe_metrics.png", dpi=120)
         plt.close(fig)
 
     def _save_checkpoint(self, path: Path, epoch: int, loss: float) -> None:

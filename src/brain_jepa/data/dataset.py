@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import pickle
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -15,18 +16,31 @@ from .atlas import AtlasMapping
 from .connectivity import FCStrategy, build_graph, pearson_correlation
 from .transforms import FeatureMode, build_feature_module
 
+NodeFeatureType = Literal["bold", "fc_row", "ones"]
+
 logger = logging.getLogger(__name__)
+
+
+def _zscore(ts: torch.Tensor) -> torch.Tensor:
+    """Z-score each region's time series independently (N, T) → (N, T)."""
+    mean = ts.mean(dim=1, keepdim=True)
+    std = ts.std(dim=1, keepdim=True).clamp(min=1e-8)
+    return (ts - mean) / std
 
 
 class BrainDataset(Dataset):
     """Dataset of resting-state fMRI subjects.
 
     Each subject file is a ``.npz`` or ``.pt`` file containing at least one of:
-    - ``time_series``: region-level BOLD time series, shape (N, T). FC is computed
-      from this and a feature module reduces it to (N, F).
-    - ``X``: time-series matrix stored as node features, shape (N, T). FC is
-      computed directly from it via Pearson correlation. An explicit
+    - ``time_series``: region-level BOLD time series, shape (N, T).
+    - ``X``: time-series matrix stored as node features, shape (N, T). An explicit
       ``fc_matrix`` key (N, N) may also be provided to override FC computation.
+
+    Args:
+        node_feature_type: What to use as node features.
+            - ``"bold"``: BOLD time series projected through the feature module → (N, F).
+            - ``"fc_row"``: each node's row of the FC matrix → (N, N).
+            - ``"ones"``: constant all-ones vector → (N, 1), graph-structure-only baseline.
 
     When ``in_channels`` is known at construction time the feature module is
     initialised eagerly, which is required for correctness when ``num_workers>0``
@@ -38,6 +52,7 @@ class BrainDataset(Dataset):
         self,
         subject_files: list[Path | str],
         atlas: AtlasMapping,
+        node_feature_type: NodeFeatureType = "bold",
         feature_mode: FeatureMode = "passthrough",
         feature_dim: int = 64,
         fc_strategy: FCStrategy = "top_k",
@@ -47,23 +62,20 @@ class BrainDataset(Dataset):
     ) -> None:
         self.files = [Path(p) for p in subject_files]
         self.atlas = atlas
+        self.node_feature_type = node_feature_type
         self.fc_strategy = fc_strategy
         self.top_k = top_k
         self.threshold = threshold
         self.feature_dim = feature_dim
         self.feature_mode = feature_mode
-        # Eagerly init when in_channels is known so all DataLoader workers share
-        # the same weights rather than each creating their own random copy.
         self._feature_module: torch.nn.Module | None = (
             build_feature_module(feature_mode, in_channels, feature_dim)
-            if in_channels is not None
+            if in_channels is not None and node_feature_type == "bold"
             else None
         )
 
     def _get_feature_module(self, in_channels: int) -> torch.nn.Module:
         if self._feature_module is None:
-            # Deterministic seed so workers that fork after this point all
-            # produce identical weights; avoids per-worker random divergence.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
                 self._feature_module = build_feature_module(
@@ -79,20 +91,28 @@ class BrainDataset(Dataset):
         raw = _load_subject(path)
 
         if "time_series" in raw:
-            ts = torch.as_tensor(raw["time_series"], dtype=torch.float32)
+            ts = _zscore(torch.as_tensor(raw["time_series"], dtype=torch.float32))
             fc_matrix = pearson_correlation(ts)
-            feat_module = self._get_feature_module(ts.shape[1])
-            with torch.no_grad():
-                x = feat_module(ts)
         elif "X" in raw:
-            x = torch.as_tensor(raw["X"], dtype=torch.float32)
+            ts = _zscore(torch.as_tensor(raw["X"], dtype=torch.float32))
             if "fc_matrix" in raw:
                 fc_matrix = torch.as_tensor(raw["fc_matrix"], dtype=torch.float32)
             else:
-                # Treat X as (N, T) — pearson_correlation expects (N, T) → (N, N)
-                fc_matrix = pearson_correlation(x) if x.shape[1] > 1 else torch.eye(x.shape[0])
+                fc_matrix = pearson_correlation(ts) if ts.shape[1] > 1 else torch.eye(ts.shape[0])
         else:
             raise KeyError(f"Subject file {path} must contain 'time_series' or 'X'")
+
+        N = fc_matrix.shape[0]
+        if self.node_feature_type == "bold":
+            feat_module = self._get_feature_module(ts.shape[1])
+            with torch.no_grad():
+                x = feat_module(ts)
+        elif self.node_feature_type == "fc_row":
+            x = fc_matrix  # (N, N)
+        elif self.node_feature_type == "ones":
+            x = torch.ones(N, 1)
+        else:
+            raise ValueError(f"Unknown node_feature_type: {self.node_feature_type!r}")
 
         graph = build_graph(
             fc_matrix,
@@ -116,7 +136,6 @@ def _load_dict_file(path: Path) -> dict:
         with path.open("rb") as fh:
             return pickle.load(fh)
     if path.suffix == ".pt":
-        # weights_only=False needed for dicts containing non-tensor objects
         return torch.load(path, map_location="cpu", weights_only=False)
     if path.suffix == ".npz":
         raw = np.load(path, allow_pickle=True)
@@ -144,14 +163,15 @@ class FCDictDataset(Dataset):
             ...
         }
 
-    The FC matrix is used directly for graph construction (no Pearson recomputation).
-    BOLD is passed through the feature module to produce (N, F) node features.
-
     Args:
+        node_feature_type: What to use as node features.
+            - ``"bold"``: BOLD time series projected through the feature module → (N, F).
+            - ``"fc_row"``: each node's row of the FC matrix → (N, N).
+            - ``"ones"``: constant all-ones vector → (N, 1), graph-structure-only baseline.
         dict_path: Path to the .pt file.
         atlas: Atlas with region-to-RSN mapping.
-        feature_mode: How to reduce BOLD to node features.
-        feature_dim: Output feature dimension F.
+        feature_mode: How to reduce BOLD to node features (only used when node_feature_type="bold").
+        feature_dim: Output feature dimension F (only used when node_feature_type="bold").
         fc_strategy: Edge selection strategy applied to the FC matrix.
         top_k: Used when fc_strategy="top_k".
         threshold: Used for threshold-based strategies.
@@ -165,6 +185,7 @@ class FCDictDataset(Dataset):
         self,
         dict_path: str | Path,
         atlas: AtlasMapping,
+        node_feature_type: NodeFeatureType = "bold",
         feature_mode: FeatureMode = "passthrough",
         feature_dim: int = 64,
         fc_strategy: FCStrategy = "top_k",
@@ -177,6 +198,7 @@ class FCDictDataset(Dataset):
         self._data: dict = _load_dict_file(Path(dict_path))
         self._subject_ids: list = list(self._data.keys())
         self.atlas = atlas
+        self.node_feature_type = node_feature_type
         self.feature_mode = feature_mode
         self.feature_dim = feature_dim
         self.fc_strategy = fc_strategy
@@ -211,12 +233,21 @@ class FCDictDataset(Dataset):
             threshold=self.threshold,
         )
 
-        bold = torch.as_tensor(subject[self.bold_key], dtype=torch.float32)
-        if self.transpose_bold:
-            bold = bold.T  # (T, N) → (N, T)
-        feat_module = self._get_feature_module(bold.shape[1])
-        with torch.no_grad():
-            x = feat_module(bold)  # (N, F)
+        N = fc.shape[0]
+        if self.node_feature_type == "bold":
+            bold = torch.as_tensor(subject[self.bold_key], dtype=torch.float32)
+            if self.transpose_bold:
+                bold = bold.T  # (T, N) → (N, T)
+            bold = _zscore(bold)
+            feat_module = self._get_feature_module(bold.shape[1])
+            with torch.no_grad():
+                x = feat_module(bold)  # (N, F)
+        elif self.node_feature_type == "fc_row":
+            x = fc  # (N, N)
+        elif self.node_feature_type == "ones":
+            x = torch.ones(N, 1)
+        else:
+            raise ValueError(f"Unknown node_feature_type: {self.node_feature_type!r}")
 
         graph.x = x
         graph.rsn_ids = self.atlas.rsn_ids.clone()

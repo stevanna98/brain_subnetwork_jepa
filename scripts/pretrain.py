@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from brain_jepa.data import BrainDataset, FCDictDataset, SyntheticBrainDataset
 from brain_jepa.data.atlas import load_atlas
+from brain_jepa.evaluation import ProbeEvaluator
 from brain_jepa.masking import SubnetworkMaskCollator
 from brain_jepa.models import build_bsjepa
 from brain_jepa.training import (
@@ -74,6 +75,18 @@ def main() -> None:
     logger.info("Atlas: %d regions, %d RSNs", atlas.num_regions, atlas.num_rsns)
 
     # Dataset
+    node_feature_type = cfg.data.get("node_feature_type", "bold")
+    # in_channels depends on what we use as node features
+    if node_feature_type == "bold":
+        in_channels = int(cfg.data.feature_dim)
+    elif node_feature_type == "fc_row":
+        in_channels = atlas.num_regions
+    elif node_feature_type == "ones":
+        in_channels = 1
+    else:
+        logger.error("Unknown node_feature_type: %s", node_feature_type)
+        sys.exit(1)
+
     if cfg.data.get("synthetic", False):
         dataset = SyntheticBrainDataset(
             atlas=atlas,
@@ -88,6 +101,7 @@ def main() -> None:
         dataset = FCDictDataset(
             dict_path=Path(cfg.data.dict_file),
             atlas=atlas,
+            node_feature_type=node_feature_type,
             feature_mode=cfg.data.feature_mode,
             feature_dim=int(cfg.data.feature_dim),
             fc_strategy=cfg.data.fc_strategy,
@@ -107,6 +121,7 @@ def main() -> None:
         dataset = BrainDataset(
             subject_files=subject_files,
             atlas=atlas,
+            node_feature_type=node_feature_type,
             feature_mode=cfg.data.feature_mode,
             feature_dim=int(cfg.data.feature_dim),
             fc_strategy=cfg.data.fc_strategy,
@@ -114,6 +129,8 @@ def main() -> None:
             threshold=float(cfg.data.threshold),
         )
         logger.info("Dataset: %d subjects", len(dataset))
+
+    logger.info("Node feature type: %s → in_channels=%d", node_feature_type, in_channels)
 
     # Mask collator (used in DataLoader's collate_fn via the Trainer)
     mask_collator = SubnetworkMaskCollator(
@@ -136,7 +153,7 @@ def main() -> None:
     model = build_bsjepa(
         atlas=atlas,
         encoder_type=cfg.model.encoder_type,
-        in_channels=int(cfg.data.feature_dim),
+        in_channels=in_channels,
         encoder_hidden=int(cfg.model.encoder_hidden),
         encoder_out=int(cfg.model.encoder_out),
         encoder_layers=int(cfg.model.encoder_layers),
@@ -184,6 +201,32 @@ def main() -> None:
         total_steps=total_steps,
     )
 
+    # Probe evaluator — uses a random subset of the training dataset
+    probe_evaluator = None
+    probe_cfg = cfg.get("probe", {})
+    probe_freq = int(probe_cfg.get("freq", 10))
+    if not cfg.data.get("synthetic", False) and probe_freq > 0:
+        probe_size = int(probe_cfg.get("num_subjects", min(200, len(dataset))))
+        g = torch.Generator().manual_seed(int(cfg.meta.seed))
+        probe_indices = torch.randperm(len(dataset), generator=g)[:probe_size].tolist()
+        probe_subset = torch.utils.data.Subset(dataset, probe_indices)
+        probe_loader = DataLoader(
+            probe_subset,
+            batch_size=int(cfg.data.batch_size),
+            shuffle=False,
+            num_workers=int(cfg.data.num_workers),
+            collate_fn=list,
+        )
+        probe_evaluator = ProbeEvaluator(
+            loader=probe_loader,
+            device=device,
+            train_frac=float(probe_cfg.get("train_frac", 0.8)),
+            num_epochs=int(probe_cfg.get("num_epochs", 50)),
+            lr=float(probe_cfg.get("lr", 1e-3)),
+            seed=int(cfg.meta.seed),
+        )
+        logger.info("ProbeEvaluator: %d subjects, every %d epochs", probe_size, probe_freq)
+
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
@@ -194,6 +237,7 @@ def main() -> None:
         device=device,
         clip_grad=float(cfg.training.clip_grad) if cfg.training.clip_grad else None,
         log_freq=int(cfg.logging.log_freq),
+        probe_evaluator=probe_evaluator,
     )
 
     output_dir = Path(cfg.meta.output_dir)
@@ -203,6 +247,7 @@ def main() -> None:
         checkpoint_dir=output_dir,
         checkpoint_freq=int(cfg.logging.checkpoint_freq),
         plot_dir=Path(cfg.logging.plot_dir) if cfg.logging.get("plot_dir") else None,
+        probe_freq=probe_freq,
     )
 
 

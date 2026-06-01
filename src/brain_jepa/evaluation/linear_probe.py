@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -166,3 +167,122 @@ class RegressionProbe(nn.Module):
         pearson_r = (vx @ vy / denom).item() if denom > 0 else 0.0
 
         return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": pearson_r}
+
+
+@torch.no_grad()
+def extract_representations_with_labels(
+    model: BSJEPA,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run the target encoder and collect per-subject embeddings, ages, and genders.
+
+    Returns:
+        features: (N, d) tensor of mean-pooled node embeddings.
+        ages:     (N,) float tensor, or None if no subject has an age attribute.
+        genders:  (N,) long tensor (0/1), or None if no subject has a gender attribute.
+    """
+    model.eval()
+    features_list: list[torch.Tensor] = []
+    ages_list: list[float] = []
+    genders_raw: list[Any] = []
+
+    for batch in loader:
+        # collate_fn=list → batch is a list of Data objects
+        data_list = batch if isinstance(batch, list) else [batch]
+        for data in data_list:
+            data = data.to(device)
+            node_emb = model.target_encoder(data)
+            features_list.append(node_emb.mean(dim=0).cpu())
+            if hasattr(data, "age"):
+                ages_list.append(float(data.age))
+            if hasattr(data, "gender"):
+                genders_raw.append(data.gender)
+
+    features = torch.stack(features_list)
+    n = len(features_list)
+
+    ages = torch.tensor(ages_list, dtype=torch.float32) if len(ages_list) == n else None
+
+    genders: torch.Tensor | None = None
+    if len(genders_raw) == n:
+        # Encode gender strings (e.g. "M"/"F", "Male"/"Female") or pass-through ints
+        unique = sorted(set(str(g) for g in genders_raw))
+        label_map = {v: i for i, v in enumerate(unique)}
+        genders = torch.tensor([label_map[str(g)] for g in genders_raw], dtype=torch.long)
+
+    return features, ages, genders
+
+
+class ProbeEvaluator:
+    """Periodically evaluates representation quality via age regression and gender classification.
+
+    A fresh probe is fitted from scratch at every call, so the frozen encoder
+    is the only thing being measured.
+
+    Args:
+        loader:       DataLoader over a labeled subset (subjects with age/gender).
+        device:       Torch device.
+        train_frac:   Fraction of subjects used to fit the probe (rest is test).
+        num_epochs:   Training epochs for each probe.
+        lr:           Learning rate for the probe optimiser.
+        seed:         RNG seed for the train/test split.
+    """
+
+    def __init__(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        train_frac: float = 0.8,
+        num_epochs: int = 50,
+        lr: float = 1e-3,
+        seed: int = 0,
+    ) -> None:
+        self.loader = loader
+        self.device = device
+        self.train_frac = train_frac
+        self.num_epochs = num_epochs
+        self.lr = lr
+        self.seed = seed
+
+    def evaluate(self, model: BSJEPA) -> dict[str, float]:
+        """Extract embeddings, fit probes, return metrics dict."""
+        features, ages, genders = extract_representations_with_labels(
+            model, self.loader, self.device
+        )
+
+        n = len(features)
+        g = torch.Generator().manual_seed(self.seed)
+        perm = torch.randperm(n, generator=g)
+        split = max(1, int(self.train_frac * n))
+        tr, te = perm[:split], perm[split:]
+
+        results: dict[str, float] = {}
+
+        if ages is not None:
+            probe = RegressionProbe(features.shape[1])
+            probe.fit(
+                features[tr], ages[tr],
+                num_epochs=self.num_epochs, lr=self.lr, device=self.device,
+            )
+            metrics = probe.evaluate(features[te].to(self.device), ages[te].to(self.device))
+            results.update({f"age_{k}": v for k, v in metrics.items()})
+            logger.info(
+                "ProbeEval | age R²=%.4f | Pearson r=%.4f",
+                metrics["r2"], metrics["pearson_r"],
+            )
+
+        if genders is not None:
+            num_classes = int(genders.max().item()) + 1
+            probe_cls = LinearProbe(features.shape[1], num_classes=num_classes)
+            probe_cls.fit(
+                features[tr], genders[tr],
+                num_epochs=self.num_epochs, lr=self.lr, device=self.device,
+            )
+            metrics_cls = probe_cls.evaluate(
+                features[te].to(self.device), genders[te].to(self.device)
+            )
+            results.update({f"gender_{k}": v for k, v in metrics_cls.items()})
+            logger.info("ProbeEval | gender acc=%.4f", metrics_cls["accuracy"])
+
+        return results
