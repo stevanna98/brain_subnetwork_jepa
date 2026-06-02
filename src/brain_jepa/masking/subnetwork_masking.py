@@ -133,10 +133,11 @@ def extract_subgraph(
     old_to_new[original_indices] = torch.arange(len(original_indices), device=device)
 
     src, dst = data.edge_index
-    if include_cross_edges:
-        keep = node_mask[src] | node_mask[dst]
-    else:
-        keep = node_mask[src] & node_mask[dst]
+    # Always require both endpoints to be in the subgraph: cross-edges would
+    # produce old_to_new=-1 for the absent endpoint, yielding invalid indices.
+    # include_cross_edges is kept as a parameter for API compatibility but
+    # the safe behaviour is identical in both cases.
+    keep = node_mask[src] & node_mask[dst]
 
     edge_index_sub = old_to_new[data.edge_index[:, keep]]
     edge_attr_sub = data.edge_attr[keep] if data.edge_attr is not None else None

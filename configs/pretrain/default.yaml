@@ -51,7 +51,7 @@ training:
   weight_decay_end: 0.4
   clip_grad: 1.0
   var_weight: 0.5   # weight of variance regularization term in the loss
-  var_gamma: 1.0    # target std; dims with std < gamma are penalised
+  var_gamma: 0.1    # target std; after LayerNorm+mean-pool, actual std ≈ 1/sqrt(N_rsn) ≈ 0.18
   ema_tau_start: 0.99
   ema_tau_end: 1.0
 

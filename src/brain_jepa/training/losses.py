@@ -10,7 +10,7 @@ def jepa_loss(
     z_hat: torch.Tensor,
     z_tgt: torch.Tensor,
     var_weight: float = 0.5,
-    var_gamma: float = 1.0,
+    var_gamma: float = 0.1,
 ) -> torch.Tensor:
     """Cosine similarity loss with variance regularization to prevent collapse.
 

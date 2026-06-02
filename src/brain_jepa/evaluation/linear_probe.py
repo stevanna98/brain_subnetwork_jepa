@@ -31,8 +31,8 @@ def extract_representations(
     subject_ids: list[str] = []
 
     for batch in loader:
-        graphs = batch[0] if isinstance(batch, (list, tuple)) else batch
-        data_list = graphs.to_data_list() if hasattr(graphs, "to_data_list") else [graphs]
+        # collate_fn=list → batch is already a list of Data objects
+        data_list = batch if isinstance(batch, list) else [batch]
         for data in data_list:
             data = data.to(device)
             node_emb = model.target_encoder(data)   # (N, d) — full graph
