@@ -147,8 +147,10 @@ def build_bsjepa(
     predictor_heads: int = 6,
     predictor_dropout: float = 0.0,
     include_cross_edges: bool = False,
+    region_positional_encoding: bool = False,
 ) -> BSJEPA:
     """Factory function — constructs a :class:`BSJEPA` from config parameters."""
+    num_regions = atlas.num_regions if region_positional_encoding else None
     if encoder_type == "gcn":
         encoder = GCNEncoder(
             in_channels=in_channels,
@@ -156,6 +158,7 @@ def build_bsjepa(
             out_channels=encoder_out,
             num_layers=encoder_layers,
             dropout=encoder_dropout,
+            num_regions=num_regions,
         )
     elif encoder_type == "graph_transformer":
         encoder = GraphTransformerEncoder(
@@ -165,6 +168,7 @@ def build_bsjepa(
             num_layers=encoder_layers,
             num_heads=encoder_heads,
             dropout=encoder_dropout,
+            num_regions=num_regions,
         )
     else:
         raise ValueError(f"Unknown encoder_type: {encoder_type!r}")

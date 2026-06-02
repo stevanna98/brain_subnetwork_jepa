@@ -96,10 +96,14 @@ class GraphTransformerEncoder(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.0,
         normalize: bool = False,
+        num_regions: int | None = None,
     ) -> None:
         super().__init__()
         self.normalize = normalize
         self.input_proj = nn.Linear(in_channels, hidden_channels)
+        self.region_embed = (
+            nn.Embedding(num_regions, hidden_channels) if num_regions is not None else None
+        )
         self.layers = nn.ModuleList(
             [GPSLayer(hidden_channels, num_heads, dropout) for _ in range(num_layers)]
         )
@@ -111,12 +115,19 @@ class GraphTransformerEncoder(nn.Module):
 
         Args:
             data: PyG Data with ``x`` (N, F), ``edge_index`` (2, E),
-                  and optionally ``edge_attr`` (E, 1).
+                  optionally ``edge_attr`` (E, 1), and optionally
+                  ``original_indices`` (N,) for subgraphs.
 
         Returns:
             Node embeddings of shape (N, d).
         """
         x = self.input_proj(data.x)
+        if self.region_embed is not None:
+            node_ids = getattr(
+                data, "original_indices",
+                torch.arange(data.num_nodes, device=x.device),
+            )
+            x = x + self.region_embed(node_ids)
         edge_index = data.edge_index
         edge_weight = data.edge_attr.squeeze(-1) if data.edge_attr is not None else None
 

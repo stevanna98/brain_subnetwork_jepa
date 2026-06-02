@@ -165,6 +165,7 @@ def main() -> None:
         predictor_heads=int(cfg.model.predictor_heads),
         predictor_dropout=float(cfg.model.predictor_dropout),
         include_cross_edges=bool(cfg.masking.include_cross_edges),
+        region_positional_encoding=bool(cfg.model.get("region_positional_encoding", True)),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -238,6 +239,8 @@ def main() -> None:
         clip_grad=float(cfg.training.clip_grad) if cfg.training.clip_grad else None,
         log_freq=int(cfg.logging.log_freq),
         probe_evaluator=probe_evaluator,
+        var_weight=float(cfg.training.get("var_weight", 0.5)),
+        var_gamma=float(cfg.training.get("var_gamma", 1.0)),
     )
 
     output_dir = Path(cfg.meta.output_dir)

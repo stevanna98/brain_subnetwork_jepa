@@ -46,6 +46,8 @@ class Trainer:
         clip_grad: If set, max gradient norm for clipping.
         log_freq: Log every this many iterations.
         probe_evaluator: If provided, evaluated every ``probe_freq`` epochs.
+        var_weight: Weight for the variance regularization term in the loss.
+        var_gamma: Target std for variance regularization.
     """
 
     def __init__(
@@ -60,6 +62,8 @@ class Trainer:
         clip_grad: float | None = 1.0,
         log_freq: int = 10,
         probe_evaluator: ProbeEvaluator | None = None,
+        var_weight: float = 0.5,
+        var_gamma: float = 1.0,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -71,6 +75,8 @@ class Trainer:
         self.clip_grad = clip_grad
         self.log_freq = log_freq
         self.probe_evaluator = probe_evaluator
+        self._var_weight = var_weight
+        self._var_gamma = var_gamma
 
     # ------------------------------------------------------------------
     # Public API
@@ -138,7 +144,9 @@ class Trainer:
             # Forward
             self.optimizer.zero_grad()
             z_hat, z_tgt = self.model(batch, masks)
-            loss = jepa_loss(z_hat, z_tgt)
+            loss = jepa_loss(z_hat, z_tgt,
+                             var_weight=self._var_weight,
+                             var_gamma=self._var_gamma)
 
             # Backward
             loss.backward()
