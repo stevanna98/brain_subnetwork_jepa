@@ -2,8 +2,9 @@
 
 Forward pass overview
 ---------------------
-1. For each subject in the batch, extract the context subgraph and run the
-   *context encoder* → (N_ctx, d) node embeddings.  No pooling.
+1. For each subject in the batch, zero the node features of target-RSN nodes
+   and run the *context encoder* on the full graph → (N, d).  Index context
+   nodes → (N_ctx, d).  Full edge structure is preserved; no subgraph extraction.
 2. Run the *target encoder* (EMA copy, no-grad) on the full graph → (N, d);
    index target-RSN nodes → (N_tgt, d).  No pooling.
 3. Run the *predictor* with all context node embeddings + one mask token per
@@ -25,7 +26,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 
 from ..data.atlas import AtlasMapping
-from ..masking.subnetwork_masking import MaskOutput, extract_subgraph
+from ..masking.subnetwork_masking import MaskOutput
 from .encoders import GCNEncoder, GraphTransformerEncoder
 from .predictor import SubnetworkPredictor
 
@@ -50,14 +51,12 @@ class BSJEPA(nn.Module):
         context_encoder: nn.Module,
         predictor: SubnetworkPredictor,
         atlas: AtlasMapping,
-        include_cross_edges: bool = False,
         feature_extractor: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.context_encoder = context_encoder
         self.predictor = predictor
         self.atlas = atlas
-        self.include_cross_edges = include_cross_edges
         # Trained end-to-end via context path; shared between context and target
         self.feature_extractor = feature_extractor
 
@@ -72,9 +71,16 @@ class BSJEPA(nn.Module):
         # representations capture inter-network context, not just intra-RSN structure.
         return self.target_encoder(data)
 
-    def _encode_context(self, data: Data, node_mask: torch.Tensor) -> tuple[torch.Tensor, Data]:
-        sub = extract_subgraph(data, node_mask, include_cross_edges=self.include_cross_edges)
-        return self.context_encoder(sub), sub
+    def _encode_context(self, data: Data, tgt_mask: torch.Tensor) -> torch.Tensor:
+        """Zero target-node features and run the context encoder on the full graph.
+
+        Returns full-graph node embeddings (N, d).  The caller indexes context
+        nodes from the result; the full edge structure is preserved.
+        """
+        masked = data.clone()
+        masked.x = data.x.clone()
+        masked.x[tgt_mask] = 0.0
+        return self.context_encoder(masked)  # (N, d)
 
     @torch.no_grad()
     def encode(self, data: Data) -> torch.Tensor:
@@ -120,14 +126,15 @@ class BSJEPA(nn.Module):
             ctx_mask = masks.context_node_masks[b]
             tgt_mask = masks.target_node_masks[b]
 
-            # Context branch: node-level, no pooling → (N_ctx, d)
-            ctx_emb, ctx_sub = self._encode_context(data_b, ctx_mask)
-            ctx_node_rsn_ids = data_b.rsn_ids[ctx_sub.original_indices]  # (N_ctx,)
+            # Context branch: zero target features, encode full graph, index context nodes
+            ctx_full_emb = self._encode_context(data_b, tgt_mask)  # (N, d)
+            ctx_emb = ctx_full_emb[ctx_mask]                        # (N_ctx, d)
+            ctx_node_rsn_ids = data_b.rsn_ids[ctx_mask]            # (N_ctx,)
 
-            # Target branch: node-level, no pooling → (N_tgt, d)
+            # Target branch: full graph, index target nodes → (N_tgt, d)
             tgt_emb_full = self._encode_target(data_b)
-            tgt_emb = tgt_emb_full[tgt_mask]                             # (N_tgt, d)
-            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]                 # (N_tgt,)
+            tgt_emb = tgt_emb_full[tgt_mask]                        # (N_tgt, d)
+            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]            # (N_tgt,)
             tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
 
             # Predict one embedding per target node
@@ -156,7 +163,6 @@ def build_bsjepa(
     predictor_depth: int = 6,
     predictor_heads: int = 6,
     predictor_dropout: float = 0.0,
-    include_cross_edges: bool = False,
     region_positional_encoding: bool = False,
     feature_extractor: nn.Module | None = None,
 ) -> BSJEPA:
@@ -196,6 +202,5 @@ def build_bsjepa(
         context_encoder=encoder,
         predictor=predictor,
         atlas=atlas,
-        include_cross_edges=include_cross_edges,
         feature_extractor=feature_extractor,
     )

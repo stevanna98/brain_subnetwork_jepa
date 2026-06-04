@@ -178,7 +178,6 @@ def main() -> None:
         predictor_depth=int(cfg.model.predictor_depth),
         predictor_heads=int(cfg.model.predictor_heads),
         predictor_dropout=float(cfg.model.predictor_dropout),
-        include_cross_edges=bool(cfg.masking.include_cross_edges),
         region_positional_encoding=bool(cfg.model.get("region_positional_encoding", False)),
         feature_extractor=feature_extractor,
     ).to(device)
