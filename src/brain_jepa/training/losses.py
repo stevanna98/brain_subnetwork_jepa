@@ -40,6 +40,8 @@ def jepa_loss(
     # Variance regularization: std across all N_total target node embeddings
     # per feature dimension. Penalises any dim with std < var_gamma.
     std = z_tgt.std(dim=0)               # (d,)
+    mean_std = std.mean()
     var_loss = F.relu(var_gamma - std).mean()
 
-    return sim_loss + var_weight * var_loss
+    total = sim_loss + var_weight * var_loss
+    return total, sim_loss.detach(), var_loss.detach(), mean_std.detach()

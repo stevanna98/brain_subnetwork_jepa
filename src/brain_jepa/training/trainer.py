@@ -129,6 +129,9 @@ class Trainer:
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
         self.model.train()
         total_loss = 0.0
+        total_sim = 0.0
+        total_var = 0.0
+        total_std = 0.0
 
         for itr, raw_batch in enumerate(loader):
             t0 = time.time()
@@ -144,9 +147,11 @@ class Trainer:
             # Forward
             self.optimizer.zero_grad()
             z_hat, z_tgt = self.model(batch, masks)
-            loss = jepa_loss(z_hat, z_tgt,
-                             var_weight=self._var_weight,
-                             var_gamma=self._var_gamma)
+            loss, sim_loss, var_loss, mean_std = jepa_loss(
+                z_hat, z_tgt,
+                var_weight=self._var_weight,
+                var_gamma=self._var_gamma,
+            )
 
             # Backward
             loss.backward()
@@ -166,15 +171,27 @@ class Trainer:
             tau = self.ema_updater.step(self.model.context_encoder, self.model.target_encoder)
 
             total_loss += loss.item()
+            total_sim += sim_loss.item()
+            total_var += var_loss.item()
+            total_std += mean_std.item()
 
             if itr % self.log_freq == 0:
                 elapsed = time.time() - t0
                 logger.info(
-                    "Epoch %d | itr %d | loss=%.4f | lr=%.2e | wd=%.2e | tau=%.5f | %.1f ms",
-                    epoch, itr, loss.item(), lr, wd, tau, elapsed * 1000,
+                    "Epoch %d | itr %d | loss=%.4f | sim=%.4f | var=%.4f | tgt_std=%.4f"
+                    " | lr=%.2e | tau=%.5f | %.1f ms",
+                    epoch, itr,
+                    loss.item(), sim_loss.item(), var_loss.item(), mean_std.item(),
+                    lr, tau, elapsed * 1000,
                 )
 
-        return total_loss / max(len(loader), 1)
+        n = max(len(loader), 1)
+        logger.info(
+            "Epoch %d done | avg_loss=%.4f | avg_sim=%.4f | avg_var=%.4f | avg_tgt_std=%.4f",
+            epoch,
+            total_loss / n, total_sim / n, total_var / n, total_std / n,
+        )
+        return total_loss / n
 
     def _save_plots(
         self,
