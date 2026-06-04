@@ -1,7 +1,10 @@
-"""Narrow Transformer predictor — analogous to I-JEPA's VisionTransformerPredictor.
+"""Narrow Transformer predictor for node-level target prediction.
 
-Given context subnetwork tokens and mask tokens for target subnetworks,
-predicts the target-encoder's representations.
+Processes one subject at a time.  Context tokens are pooled RSN representations
+(K_c, d).  Target queries are one mask token per target NODE (N_tgt,) tagged
+with the RSN identity of each node.  The predictor outputs one embedding per
+target node (N_tgt, d), which is compared directly against the target encoder's
+node embeddings — no pooling.
 """
 
 from __future__ import annotations
@@ -11,15 +14,7 @@ import torch.nn as nn
 
 
 class SubnetworkPredictor(nn.Module):
-    """Narrow Transformer that predicts target subnetwork representations.
-
-    Design mirrors I-JEPA's predictor:
-    - Context tokens are projected to a narrower predictor dimension.
-    - Each target position is represented by a shared learnable mask token
-      summed with a learned subnetwork-identity embedding.
-    - Context and target tokens are concatenated and passed through Transformer
-      blocks; only the target positions are returned and projected back to the
-      encoder embedding dimension.
+    """Narrow Transformer that predicts target node representations.
 
     Args:
         encoder_dim: Output dimension d of the encoder.
@@ -46,16 +41,11 @@ class SubnetworkPredictor(nn.Module):
         self.predictor_dim = predictor_dim
         self.num_rsns = num_rsns
 
-        # Project context tokens from encoder dim to predictor dim
         self.input_proj = nn.Linear(encoder_dim, predictor_dim)
-
-        # One learnable mask token shared across target positions
         self.mask_token = nn.Parameter(torch.zeros(1, predictor_dim))
-
-        # Per-subnetwork identity embeddings (used for both context and target)
+        # Per-RSN identity embedding used for both context and target tokens
         self.rsn_embed = nn.Embedding(num_rsns, predictor_dim)
 
-        # Transformer backbone
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=predictor_dim,
             nhead=num_heads,
@@ -69,8 +59,6 @@ class SubnetworkPredictor(nn.Module):
             encoder_layer, num_layers=depth, enable_nested_tensor=False
         )
         self.norm = nn.LayerNorm(predictor_dim)
-
-        # Project predictions back to encoder dim
         self.output_proj = nn.Linear(predictor_dim, encoder_dim)
 
         self._init_weights()
@@ -88,38 +76,35 @@ class SubnetworkPredictor(nn.Module):
         self,
         context_tokens: torch.Tensor,
         context_rsn_ids: torch.Tensor,
-        target_rsn_ids: torch.Tensor,
+        target_node_rsn_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict target subnetwork representations.
+        """Predict node-level target representations for one subject.
 
         Args:
-            context_tokens: (B, K_c, encoder_dim) context subnetwork tokens.
-            context_rsn_ids: (B, K_c) RSN indices for context tokens (0-based).
-            target_rsn_ids: (B, M) RSN indices for target tokens (0-based).
+            context_tokens:     (K_c, encoder_dim) pooled context RSN tokens.
+            context_rsn_ids:    (K_c,) RSN index for each context token.
+            target_node_rsn_ids:(N_tgt,) RSN index for each target NODE.
 
         Returns:
-            Predicted target tokens, shape (B, M, encoder_dim).
+            Predicted node embeddings, shape (N_tgt, encoder_dim).
         """
-        B, K_c, _ = context_tokens.shape
-        M = target_rsn_ids.shape[1]
+        K_c = context_tokens.shape[0]
+        N_tgt = target_node_rsn_ids.shape[0]
 
-        # Project context to predictor dimension + add identity embeddings
-        ctx = self.input_proj(context_tokens)  # (B, K_c, P)
-        ctx = ctx + self.rsn_embed(context_rsn_ids)  # (B, K_c, P)
+        # Context: project + add RSN identity
+        ctx = self.input_proj(context_tokens)           # (K_c, P)
+        ctx = ctx + self.rsn_embed(context_rsn_ids)     # (K_c, P)
 
-        # Build target query tokens: mask_token + identity embedding.
-        # The RSN embedding is detached so the shortcut gradient path
-        # (predict a fixed per-RSN direction → loss=0) is cut off.
-        # The predictor still knows which RSN to predict, but can't
-        # optimise the embedding specifically for that shortcut.
-        mask = self.mask_token.unsqueeze(0).expand(B, M, -1)          # (B, M, P)
-        mask = mask + self.rsn_embed(target_rsn_ids).detach()          # (B, M, P)
+        # Target: one mask token per node, tagged with its RSN identity.
+        # RSN embedding is detached to cut the gradient path that would allow
+        # the predictor to cheat by memorising a fixed per-RSN direction.
+        mask = self.mask_token.expand(N_tgt, -1)                        # (N_tgt, P)
+        mask = mask + self.rsn_embed(target_node_rsn_ids).detach()      # (N_tgt, P)
 
-        # Concatenate and run Transformer
-        seq = torch.cat([ctx, mask], dim=1)  # (B, K_c + M, P)
-        seq = self.transformer(seq)
+        # Run Transformer over context + target tokens (add batch dim)
+        seq = torch.cat([ctx, mask], dim=0).unsqueeze(0)  # (1, K_c + N_tgt, P)
+        seq = self.transformer(seq).squeeze(0)             # (K_c + N_tgt, P)
         seq = self.norm(seq)
 
-        # Extract target positions and project back to encoder dim
-        pred = seq[:, K_c:]          # (B, M, P)
-        return self.output_proj(pred)  # (B, M, encoder_dim)
+        pred = seq[K_c:]                    # (N_tgt, P)
+        return self.output_proj(pred)       # (N_tgt, encoder_dim)

@@ -2,14 +2,13 @@
 
 Forward pass overview
 ---------------------
-1. For each subject in the batch, extract the context subgraph (induced on
-   context-RSN nodes) and run the *context encoder* → node embeddings.
-2. Pool context node embeddings per context RSN → context tokens z_ctx.
-3. Run the *target encoder* (EMA copy, no-grad) on the **full graph** → node
-   embeddings for all N regions; index target-RSN nodes from this embedding.
-4. Pool target node embeddings per target RSN → target tokens z_tgt.
-5. Run the *predictor* on z_ctx + mask tokens → predicted z_hat.
-6. Return (z_hat, z_tgt) for the loss.
+1. For each subject in the batch, extract the context subgraph and run the
+   *context encoder* → node embeddings, then pool per context RSN → (K_c, d).
+2. Run the *target encoder* (EMA copy, no-grad) on the full graph → (N, d);
+   index target-RSN nodes → (N_tgt, d).  No pooling — node-level targets.
+3. Run the *predictor* with context tokens + one mask token per target NODE
+   → (N_tgt, d) predicted node embeddings.
+4. Concatenate across subjects and return (N_total, d) pairs for the loss.
 
 The EMA update is performed externally by the :class:`~brain_jepa.training.ema.EMAUpdater`.
 """
@@ -103,8 +102,9 @@ class BSJEPA(nn.Module):
             masks: Subnetwork mask assignments from the collator.
 
         Returns:
-            z_hat: Predicted target tokens, shape (B, M, d).
-            z_tgt: Stop-gradient target tokens, shape (B, M, d).
+            z_hat: Predicted node embeddings, shape (N_total, d).
+            z_tgt: Stop-gradient target node embeddings, shape (N_total, d).
+                   N_total = sum of target-RSN nodes across all subjects in batch.
         """
         data_list = batch.to_data_list()
         B = len(data_list)
@@ -115,41 +115,37 @@ class BSJEPA(nn.Module):
             for data_b in data_list:
                 data_b.x = self.feature_extractor(data_b.x)
 
-        ctx_tokens_list: list[torch.Tensor] = []
-        tgt_tokens_list: list[torch.Tensor] = []
+        z_hat_list: list[torch.Tensor] = []
+        z_tgt_list: list[torch.Tensor] = []
 
         for b in range(B):
             data_b = data_list[b]
             ctx_mask = masks.context_node_masks[b]
             tgt_mask = masks.target_node_masks[b]
             ctx_rsns = masks.context_rsn_ids[b]
-            tgt_rsns = masks.target_rsn_ids[b]
 
-            # Context branch
-            ctx_emb, ctx_sub = self._encode_context(data_b, ctx_mask)  # (N_ctx, d)
+            # Context branch: pool per RSN → (K_c, d) context tokens
+            ctx_emb, ctx_sub = self._encode_context(data_b, ctx_mask)
             ctx_rsn_ids = data_b.rsn_ids[ctx_sub.original_indices]
             ctx_tokens = self.pooling(ctx_emb, ctx_rsn_ids, ctx_rsns)  # (K_c, d)
-            ctx_tokens_list.append(ctx_tokens)
 
-            # Target branch (no grad, target encoder sees full graph)
-            tgt_emb_full = self._encode_target(data_b)          # (N, d)
-            tgt_emb = tgt_emb_full[tgt_mask]                    # (N_tgt, d)
-            tgt_rsn_ids = data_b.rsn_ids[tgt_mask]
-            # Layer-normalise target embeddings (mirrors I-JEPA)
+            # Target branch: node-level, no pooling → (N_tgt, d)
+            tgt_emb_full = self._encode_target(data_b)      # (N, d)
+            tgt_emb = tgt_emb_full[tgt_mask]                # (N_tgt, d)
+            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]    # (N_tgt,) RSN per node
             tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
-            tgt_tokens = self.pooling(tgt_emb, tgt_rsn_ids, tgt_rsns)  # (M, d)
-            tgt_tokens_list.append(tgt_tokens)
 
-        ctx_tokens_batch = torch.stack(ctx_tokens_list)  # (B, K_c, d)
-        tgt_tokens_batch = torch.stack(tgt_tokens_list)  # (B, M, d)
+            # Predict one embedding per target node
+            z_hat_b = self.predictor(ctx_tokens, ctx_rsns, tgt_node_rsn_ids)  # (N_tgt, d)
 
-        z_hat = self.predictor(
-            ctx_tokens_batch,
-            masks.context_rsn_ids,
-            masks.target_rsn_ids,
-        )  # (B, M, d)
+            z_hat_list.append(z_hat_b)
+            z_tgt_list.append(tgt_emb)
 
-        return z_hat, tgt_tokens_batch.detach()
+        # Concatenate across subjects: (N_total, d)
+        z_hat = torch.cat(z_hat_list, dim=0)
+        z_tgt = torch.cat(z_tgt_list, dim=0)
+
+        return z_hat, z_tgt.detach()
 
 
 def build_bsjepa(
