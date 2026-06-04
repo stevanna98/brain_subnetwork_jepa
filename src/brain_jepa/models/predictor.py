@@ -107,9 +107,13 @@ class SubnetworkPredictor(nn.Module):
         ctx = self.input_proj(context_tokens)  # (B, K_c, P)
         ctx = ctx + self.rsn_embed(context_rsn_ids)  # (B, K_c, P)
 
-        # Build target query tokens: mask_token + identity embedding
-        mask = self.mask_token.unsqueeze(0).expand(B, M, -1)  # (B, M, P)
-        mask = mask + self.rsn_embed(target_rsn_ids)           # (B, M, P)
+        # Build target query tokens: mask_token + identity embedding.
+        # The RSN embedding is detached so the shortcut gradient path
+        # (predict a fixed per-RSN direction → loss=0) is cut off.
+        # The predictor still knows which RSN to predict, but can't
+        # optimise the embedding specifically for that shortcut.
+        mask = self.mask_token.unsqueeze(0).expand(B, M, -1)          # (B, M, P)
+        mask = mask + self.rsn_embed(target_rsn_ids).detach()          # (B, M, P)
 
         # Concatenate and run Transformer
         seq = torch.cat([ctx, mask], dim=1)  # (B, K_c + M, P)

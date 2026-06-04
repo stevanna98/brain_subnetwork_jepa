@@ -76,6 +76,8 @@ def main() -> None:
 
     ckpt = torch.load(cfg.model.checkpoint, map_location="cpu", weights_only=False)
     model.target_encoder.load_state_dict(ckpt["target_encoder"])
+    if model.feature_extractor is not None and "feature_extractor" in ckpt:
+        model.feature_extractor.load_state_dict(ckpt["feature_extractor"])
     logger.info("Loaded checkpoint from %s (epoch %d)", cfg.model.checkpoint, ckpt.get("epoch", "?"))
 
     # Extract representations and subject IDs

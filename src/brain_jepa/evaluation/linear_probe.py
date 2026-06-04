@@ -35,7 +35,7 @@ def extract_representations(
         data_list = batch if isinstance(batch, list) else [batch]
         for data in data_list:
             data = data.to(device)
-            node_emb = model.target_encoder(data)   # (N, d) — full graph
+            node_emb = model.encode(data)   # feature extractor + target encoder (N, d)
             features_list.append(node_emb.mean(dim=0).cpu())
             subject_ids.append(str(getattr(data, "subject_id", "")))
 
@@ -192,7 +192,7 @@ def extract_representations_with_labels(
         data_list = batch if isinstance(batch, list) else [batch]
         for data in data_list:
             data = data.to(device)
-            node_emb = model.target_encoder(data)
+            node_emb = model.encode(data)
             features_list.append(node_emb.mean(dim=0).cpu())
             if hasattr(data, "age"):
                 ages_list.append(float(data.age))

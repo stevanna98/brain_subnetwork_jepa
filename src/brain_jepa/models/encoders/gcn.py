@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GCNConv
 
 
 class GCNEncoder(nn.Module):
@@ -46,7 +46,7 @@ class GCNEncoder(nn.Module):
 
         dims = [hidden_channels] * num_layers + [out_channels]
         self.convs = nn.ModuleList(
-            [SAGEConv(dims[i], dims[i + 1]) for i in range(num_layers)]
+            [GCNConv(dims[i], dims[i + 1], add_self_loops=False) for i in range(num_layers)]
         )
         self.norms = nn.ModuleList(
             [nn.LayerNorm(dims[i + 1]) for i in range(num_layers)]
@@ -63,6 +63,7 @@ class GCNEncoder(nn.Module):
             Node embeddings of shape (N, d).
         """
         x, edge_index = data.x, data.edge_index
+        edge_weight = data.edge_attr.squeeze(-1) if data.edge_attr is not None else None
         x = self.input_proj(x)
         if self.region_embed is not None:
             node_ids = getattr(
@@ -71,7 +72,7 @@ class GCNEncoder(nn.Module):
             )
             x = x + self.region_embed(node_ids)
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms, strict=True)):
-            x = conv(x, edge_index)
+            x = conv(x, edge_index, edge_weight)
             x = norm(x)
             if i < len(self.convs) - 1:
                 x = F.gelu(x)

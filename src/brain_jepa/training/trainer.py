@@ -63,7 +63,7 @@ class Trainer:
         log_freq: int = 10,
         probe_evaluator: ProbeEvaluator | None = None,
         var_weight: float = 0.5,
-        var_gamma: float = 1.0,
+        var_gamma: float = 0.1,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -151,11 +151,13 @@ class Trainer:
             # Backward
             loss.backward()
             if self.clip_grad is not None:
-                nn.utils.clip_grad_norm_(
+                params = (
                     list(self.model.context_encoder.parameters())
-                    + list(self.model.predictor.parameters()),
-                    self.clip_grad,
+                    + list(self.model.predictor.parameters())
                 )
+                if self.model.feature_extractor is not None:
+                    params += list(self.model.feature_extractor.parameters())
+                nn.utils.clip_grad_norm_(params, self.clip_grad)
             self.optimizer.step()
 
             # Schedules + EMA
@@ -243,6 +245,8 @@ class Trainer:
             "predictor": self.model.predictor.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
+        if self.model.feature_extractor is not None:
+            state["feature_extractor"] = self.model.feature_extractor.state_dict()
         torch.save(state, path)
         logger.info("Checkpoint saved → %s", path)
 
@@ -253,5 +257,7 @@ class Trainer:
         model.context_encoder.load_state_dict(state["context_encoder"])
         model.target_encoder.load_state_dict(state["target_encoder"])
         model.predictor.load_state_dict(state["predictor"])
+        if model.feature_extractor is not None and "feature_extractor" in state:
+            model.feature_extractor.load_state_dict(state["feature_extractor"])
         optimizer.load_state_dict(state["optimizer"])
         return state["epoch"]

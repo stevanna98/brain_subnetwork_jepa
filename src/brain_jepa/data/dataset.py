@@ -104,9 +104,7 @@ class BrainDataset(Dataset):
 
         N = fc_matrix.shape[0]
         if self.node_feature_type == "bold":
-            feat_module = self._get_feature_module(ts.shape[1])
-            with torch.no_grad():
-                x = feat_module(ts)
+            x = ts  # raw z-scored BOLD (N, T) — feature extraction done in the model
         elif self.node_feature_type == "fc_row":
             x = fc_matrix  # (N, N)
         elif self.node_feature_type == "ones":
@@ -238,10 +236,7 @@ class FCDictDataset(Dataset):
             bold = torch.as_tensor(subject[self.bold_key], dtype=torch.float32)
             if self.transpose_bold:
                 bold = bold.T  # (T, N) → (N, T)
-            bold = _zscore(bold)
-            feat_module = self._get_feature_module(bold.shape[1])
-            with torch.no_grad():
-                x = feat_module(bold)  # (N, F)
+            x = _zscore(bold)  # raw z-scored BOLD (N, T) — feature extraction done in the model
         elif self.node_feature_type == "fc_row":
             x = fc  # (N, N)
         elif self.node_feature_type == "ones":

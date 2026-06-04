@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from brain_jepa.data import BrainDataset, FCDictDataset, SyntheticBrainDataset
 from brain_jepa.data.atlas import load_atlas
+from brain_jepa.data.transforms import build_feature_module
 from brain_jepa.evaluation import ProbeEvaluator
 from brain_jepa.masking import SubnetworkMaskCollator
 from brain_jepa.models import build_bsjepa
@@ -130,6 +131,20 @@ def main() -> None:
         )
         logger.info("Dataset: %d subjects", len(dataset))
 
+    # For bold mode: detect T from first sample, build trainable feature extractor
+    feature_extractor = None
+    if node_feature_type == "bold" and not cfg.data.get("synthetic", False):
+        time_points = dataset[0].x.shape[1]
+        feature_extractor = build_feature_module(
+            cfg.data.feature_mode,
+            in_channels=time_points,
+            out_channels=int(cfg.data.feature_dim),
+        ).to(device)
+        logger.info(
+            "Feature extractor: %s | T=%d → F=%d",
+            cfg.data.feature_mode, time_points, cfg.data.feature_dim,
+        )
+
     logger.info("Node feature type: %s → in_channels=%d", node_feature_type, in_channels)
 
     # Mask collator (used in DataLoader's collate_fn via the Trainer)
@@ -165,7 +180,8 @@ def main() -> None:
         predictor_heads=int(cfg.model.predictor_heads),
         predictor_dropout=float(cfg.model.predictor_dropout),
         include_cross_edges=bool(cfg.masking.include_cross_edges),
-        region_positional_encoding=bool(cfg.model.get("region_positional_encoding", True)),
+        region_positional_encoding=bool(cfg.model.get("region_positional_encoding", False)),
+        feature_extractor=feature_extractor,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -176,9 +192,11 @@ def main() -> None:
     total_steps = iters_per_epoch * int(cfg.training.num_epochs)
     warmup_steps = iters_per_epoch * int(cfg.training.warmup_epochs)
 
+    modules_to_train = [model.context_encoder, model.predictor]
+    if model.feature_extractor is not None:
+        modules_to_train.append(model.feature_extractor)
     optimizer = build_optimizer(
-        model.context_encoder,
-        model.predictor,
+        *modules_to_train,
         lr=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay_start),
     )

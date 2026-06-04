@@ -76,18 +76,17 @@ class LinearWDSchedule:
 
 
 def build_optimizer(
-    context_encoder: nn.Module,
-    predictor: nn.Module,
+    *modules: nn.Module,
     lr: float = 1e-3,
     weight_decay: float = 0.04,
     betas: tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
 ) -> torch.optim.AdamW:
-    """Create AdamW optimizer; bias/norm params are exempt from weight decay."""
+    """Create AdamW optimizer over any number of modules; bias/norm params exempt from WD."""
     no_wd_params: list[torch.Tensor] = []
     wd_params: list[torch.Tensor] = []
 
-    for module in [context_encoder, predictor]:
+    for module in modules:
         for name, param in module.named_parameters():
             if not param.requires_grad:
                 continue

@@ -54,6 +54,7 @@ class BSJEPA(nn.Module):
         pooling: nn.Module,
         atlas: AtlasMapping,
         include_cross_edges: bool = False,
+        feature_extractor: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.context_encoder = context_encoder
@@ -61,6 +62,8 @@ class BSJEPA(nn.Module):
         self.pooling = pooling
         self.atlas = atlas
         self.include_cross_edges = include_cross_edges
+        # Trained end-to-end via context path; shared between context and target
+        self.feature_extractor = feature_extractor
 
         # Target encoder: EMA copy — no gradient flow through it
         self.target_encoder = copy.deepcopy(context_encoder)
@@ -76,6 +79,17 @@ class BSJEPA(nn.Module):
     def _encode_context(self, data: Data, node_mask: torch.Tensor) -> tuple[torch.Tensor, Data]:
         sub = extract_subgraph(data, node_mask, include_cross_edges=self.include_cross_edges)
         return self.context_encoder(sub), sub
+
+    @torch.no_grad()
+    def encode(self, data: Data) -> torch.Tensor:
+        """Feature extractor + target encoder on a single graph; used at eval time.
+
+        Returns node embeddings of shape (N, d).
+        """
+        if self.feature_extractor is not None:
+            data = data.clone()
+            data.x = self.feature_extractor(data.x)
+        return self.target_encoder(data)
 
     def forward(
         self,
@@ -94,6 +108,12 @@ class BSJEPA(nn.Module):
         """
         data_list = batch.to_data_list()
         B = len(data_list)
+
+        # Apply the feature extractor once per subject (with gradients — it is
+        # trained via the context path; target path is stopped by .detach() later)
+        if self.feature_extractor is not None:
+            for data_b in data_list:
+                data_b.x = self.feature_extractor(data_b.x)
 
         ctx_tokens_list: list[torch.Tensor] = []
         tgt_tokens_list: list[torch.Tensor] = []
@@ -148,6 +168,7 @@ def build_bsjepa(
     predictor_dropout: float = 0.0,
     include_cross_edges: bool = False,
     region_positional_encoding: bool = False,
+    feature_extractor: nn.Module | None = None,
 ) -> BSJEPA:
     """Factory function — constructs a :class:`BSJEPA` from config parameters."""
     num_regions = atlas.num_regions if region_positional_encoding else None
@@ -188,4 +209,5 @@ def build_bsjepa(
         pooling=pooling,
         atlas=atlas,
         include_cross_edges=include_cross_edges,
+        feature_extractor=feature_extractor,
     )
