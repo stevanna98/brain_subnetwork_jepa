@@ -37,11 +37,15 @@ def jepa_loss(
     z_tgt_n = F.normalize(z_tgt, dim=-1)
     sim_loss = 2 - 2 * (z_hat_n * z_tgt_n).sum(dim=-1).mean()
 
-    # Variance regularization: std across all N_total target node embeddings
-    # per feature dimension. Penalises any dim with std < var_gamma.
-    std = z_tgt.std(dim=0)               # (d,)
-    mean_std = std.mean()
-    var_loss = F.relu(var_gamma - std).mean()
+    # Variance regularization on z_hat (has gradients through predictor +
+    # context encoder).  Applying it to z_tgt would be a no-op because z_tgt
+    # is detached.  Pushing z_hat to be diverse forces the context encoder to
+    # produce diverse outputs; via EMA the target encoder follows.
+    std_hat = z_hat.std(dim=0)                        # (d,)
+    var_loss = F.relu(var_gamma - std_hat).mean()
+
+    # Log target std for monitoring collapse (no gradient, diagnostic only)
+    mean_std = z_tgt.std(dim=0).mean()
 
     total = sim_loss + var_weight * var_loss
     return total, sim_loss.detach(), var_loss.detach(), mean_std.detach()
