@@ -50,8 +50,9 @@ training:
   weight_decay_start: 0.04
   weight_decay_end: 0.4
   clip_grad: 1.0
-  var_weight: 0.5   # weight of variance regularization term in the loss
-  var_gamma: 0.1    # target std; after LayerNorm+mean-pool, actual std ≈ 1/sqrt(N_rsn) ≈ 0.18
+  var_weight: 0.5       # weight of predictor output variance term
+  ctx_var_weight: 1.0  # weight of DIRECT context encoder variance term (key anti-collapse signal)
+  var_gamma: 0.1        # target std; dims below this are penalised
   ema_tau_start: 0.99
   ema_tau_end: 1.0
 

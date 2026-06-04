@@ -97,7 +97,7 @@ class BSJEPA(nn.Module):
         self,
         batch: Batch,
         masks: MaskOutput,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the full BS-JEPA forward pass.
 
         Args:
@@ -105,21 +105,22 @@ class BSJEPA(nn.Module):
             masks: Subnetwork mask assignments from the collator.
 
         Returns:
-            z_hat: Predicted node embeddings, shape (N_total, d).
-            z_tgt: Stop-gradient target node embeddings, shape (N_total, d).
-                   N_total = sum of target-RSN nodes across all subjects in batch.
+            z_hat:    Predicted node embeddings, shape (N_tgt_total, d).
+            z_tgt:    Stop-gradient target node embeddings, shape (N_tgt_total, d).
+            ctx_embs: Context node embeddings, shape (N_ctx_total, d).
+                      Has gradients — used for direct variance regularisation on
+                      the context encoder without going through the predictor.
         """
         data_list = batch.to_data_list()
         B = len(data_list)
 
-        # Apply the feature extractor once per subject (with gradients — it is
-        # trained via the context path; target path is stopped by .detach() later)
         if self.feature_extractor is not None:
             for data_b in data_list:
                 data_b.x = self.feature_extractor(data_b.x)
 
         z_hat_list: list[torch.Tensor] = []
         z_tgt_list: list[torch.Tensor] = []
+        ctx_embs_list: list[torch.Tensor] = []
 
         for b in range(B):
             data_b = data_list[b]
@@ -137,17 +138,17 @@ class BSJEPA(nn.Module):
             tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]            # (N_tgt,)
             tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
 
-            # Predict one embedding per target node
-            z_hat_b = self.predictor(ctx_emb, ctx_node_rsn_ids, tgt_node_rsn_ids)  # (N_tgt, d)
+            z_hat_b = self.predictor(ctx_emb, ctx_node_rsn_ids, tgt_node_rsn_ids)
 
             z_hat_list.append(z_hat_b)
             z_tgt_list.append(tgt_emb)
+            ctx_embs_list.append(ctx_emb)
 
-        # Concatenate across subjects: (N_total, d)
-        z_hat = torch.cat(z_hat_list, dim=0)
-        z_tgt = torch.cat(z_tgt_list, dim=0)
+        z_hat = torch.cat(z_hat_list, dim=0)       # (N_tgt_total, d)
+        z_tgt = torch.cat(z_tgt_list, dim=0)       # (N_tgt_total, d)
+        ctx_embs = torch.cat(ctx_embs_list, dim=0) # (N_ctx_total, d)
 
-        return z_hat, z_tgt.detach()
+        return z_hat, z_tgt.detach(), ctx_embs
 
 
 def build_bsjepa(

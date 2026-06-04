@@ -256,7 +256,8 @@ def main() -> None:
         log_freq=int(cfg.logging.log_freq),
         probe_evaluator=probe_evaluator,
         var_weight=float(cfg.training.get("var_weight", 0.5)),
-        var_gamma=float(cfg.training.get("var_gamma", 1.0)),
+        ctx_var_weight=float(cfg.training.get("ctx_var_weight", 1.0)),
+        var_gamma=float(cfg.training.get("var_gamma", 0.1)),
     )
 
     output_dir = Path(cfg.meta.output_dir)
