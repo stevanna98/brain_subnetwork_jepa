@@ -3,11 +3,11 @@
 Forward pass overview
 ---------------------
 1. For each subject in the batch, extract the context subgraph and run the
-   *context encoder* → node embeddings, then pool per context RSN → (K_c, d).
+   *context encoder* → (N_ctx, d) node embeddings.  No pooling.
 2. Run the *target encoder* (EMA copy, no-grad) on the full graph → (N, d);
-   index target-RSN nodes → (N_tgt, d).  No pooling — node-level targets.
-3. Run the *predictor* with context tokens + one mask token per target NODE
-   → (N_tgt, d) predicted node embeddings.
+   index target-RSN nodes → (N_tgt, d).  No pooling.
+3. Run the *predictor* with all context node embeddings + one mask token per
+   target node → (N_tgt, d) predicted node embeddings.
 4. Concatenate across subjects and return (N_total, d) pairs for the loss.
 
 The EMA update is performed externally by the :class:`~brain_jepa.training.ema.EMAUpdater`.
@@ -27,7 +27,6 @@ from torch_geometric.data import Batch, Data
 from ..data.atlas import AtlasMapping
 from ..masking.subnetwork_masking import MaskOutput, extract_subgraph
 from .encoders import GCNEncoder, GraphTransformerEncoder
-from .pooling import PoolingMode, build_pooling
 from .predictor import SubnetworkPredictor
 
 logger = logging.getLogger(__name__)
@@ -50,7 +49,6 @@ class BSJEPA(nn.Module):
         self,
         context_encoder: nn.Module,
         predictor: SubnetworkPredictor,
-        pooling: nn.Module,
         atlas: AtlasMapping,
         include_cross_edges: bool = False,
         feature_extractor: nn.Module | None = None,
@@ -58,7 +56,6 @@ class BSJEPA(nn.Module):
         super().__init__()
         self.context_encoder = context_encoder
         self.predictor = predictor
-        self.pooling = pooling
         self.atlas = atlas
         self.include_cross_edges = include_cross_edges
         # Trained end-to-end via context path; shared between context and target
@@ -122,21 +119,19 @@ class BSJEPA(nn.Module):
             data_b = data_list[b]
             ctx_mask = masks.context_node_masks[b]
             tgt_mask = masks.target_node_masks[b]
-            ctx_rsns = masks.context_rsn_ids[b]
 
-            # Context branch: pool per RSN → (K_c, d) context tokens
+            # Context branch: node-level, no pooling → (N_ctx, d)
             ctx_emb, ctx_sub = self._encode_context(data_b, ctx_mask)
-            ctx_rsn_ids = data_b.rsn_ids[ctx_sub.original_indices]
-            ctx_tokens = self.pooling(ctx_emb, ctx_rsn_ids, ctx_rsns)  # (K_c, d)
+            ctx_node_rsn_ids = data_b.rsn_ids[ctx_sub.original_indices]  # (N_ctx,)
 
             # Target branch: node-level, no pooling → (N_tgt, d)
-            tgt_emb_full = self._encode_target(data_b)      # (N, d)
-            tgt_emb = tgt_emb_full[tgt_mask]                # (N_tgt, d)
-            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]    # (N_tgt,) RSN per node
+            tgt_emb_full = self._encode_target(data_b)
+            tgt_emb = tgt_emb_full[tgt_mask]                             # (N_tgt, d)
+            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]                 # (N_tgt,)
             tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
 
             # Predict one embedding per target node
-            z_hat_b = self.predictor(ctx_tokens, ctx_rsns, tgt_node_rsn_ids)  # (N_tgt, d)
+            z_hat_b = self.predictor(ctx_emb, ctx_node_rsn_ids, tgt_node_rsn_ids)  # (N_tgt, d)
 
             z_hat_list.append(z_hat_b)
             z_tgt_list.append(tgt_emb)
@@ -157,7 +152,6 @@ def build_bsjepa(
     encoder_layers: int = 4,
     encoder_heads: int = 4,
     encoder_dropout: float = 0.0,
-    pooling_mode: PoolingMode = "mean",
     predictor_dim: int = 384,
     predictor_depth: int = 6,
     predictor_heads: int = 6,
@@ -190,7 +184,6 @@ def build_bsjepa(
     else:
         raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
 
-    pooling = build_pooling(pooling_mode, encoder_out, atlas.num_rsns)
     predictor = SubnetworkPredictor(
         encoder_dim=encoder_out,
         predictor_dim=predictor_dim,
@@ -202,7 +195,6 @@ def build_bsjepa(
     return BSJEPA(
         context_encoder=encoder,
         predictor=predictor,
-        pooling=pooling,
         atlas=atlas,
         include_cross_edges=include_cross_edges,
         feature_extractor=feature_extractor,

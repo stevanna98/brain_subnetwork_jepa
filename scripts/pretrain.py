@@ -174,7 +174,6 @@ def main() -> None:
         encoder_layers=int(cfg.model.encoder_layers),
         encoder_heads=int(cfg.model.encoder_heads),
         encoder_dropout=float(cfg.model.encoder_dropout),
-        pooling_mode=cfg.model.pooling_mode,
         predictor_dim=int(cfg.model.predictor_dim),
         predictor_depth=int(cfg.model.predictor_depth),
         predictor_heads=int(cfg.model.predictor_heads),

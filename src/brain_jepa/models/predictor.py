@@ -81,9 +81,9 @@ class SubnetworkPredictor(nn.Module):
         """Predict node-level target representations for one subject.
 
         Args:
-            context_tokens:     (K_c, encoder_dim) pooled context RSN tokens.
-            context_rsn_ids:    (K_c,) RSN index for each context token.
-            target_node_rsn_ids:(N_tgt,) RSN index for each target NODE.
+            context_tokens:      (N_ctx, encoder_dim) context node embeddings.
+            context_rsn_ids:     (N_ctx,) RSN index for each context node.
+            target_node_rsn_ids: (N_tgt,) RSN index for each target node.
 
         Returns:
             Predicted node embeddings, shape (N_tgt, encoder_dim).
