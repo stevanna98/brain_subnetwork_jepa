@@ -40,6 +40,12 @@ class SubnetworkMaskCollator:
     Args:
         num_rsns: Total number of subnetworks K (default 12).
         num_targets: Number of target subnetworks M to mask (default 1).
+        extra_target_ratio: Fraction of the *remaining* (non-target-RSN) nodes
+            that are additionally masked, sampled uniformly per subject. With
+            only K possible RSN-level masks the prediction task has K variants
+            and a large predictor can memorise them; random extra nodes make
+            every sample a distinct task while keeping the subnetwork-level
+            core. 0.0 disables (pure RSN masking).
         include_cross_edges_in_context: If True, context subgraph retains
             edges originally incident to target nodes (dangling edges are
             dropped at the GNN level since target nodes are absent). False
@@ -50,13 +56,18 @@ class SubnetworkMaskCollator:
         self,
         num_rsns: int = 12,
         num_targets: int = 1,
+        extra_target_ratio: float = 0.0,
         include_cross_edges_in_context: bool = False,
     ) -> None:
         assert 1 <= num_targets < num_rsns, (
             f"num_targets must be in [1, num_rsns-1], got {num_targets}"
         )
+        assert 0.0 <= extra_target_ratio < 1.0, (
+            f"extra_target_ratio must be in [0, 1), got {extra_target_ratio}"
+        )
         self.num_rsns = num_rsns
         self.num_targets = num_targets
+        self.extra_target_ratio = extra_target_ratio
         self.include_cross_edges_in_context = include_cross_edges_in_context
 
     def __call__(self, batch: list[Data]) -> tuple[Batch, MaskOutput]:
@@ -76,8 +87,15 @@ class SubnetworkMaskCollator:
 
         for b in range(B):
             rsn_ids = batch[b].rsn_ids  # (N,)
-            ctx_mask = torch.isin(rsn_ids, context_rsn_ids[b])
             tgt_mask = torch.isin(rsn_ids, target_rsn_ids[b])
+            if self.extra_target_ratio > 0.0:
+                candidates = (~tgt_mask).nonzero(as_tuple=True)[0]
+                n_extra = int(round(self.extra_target_ratio * candidates.numel()))
+                if n_extra > 0:
+                    extra = candidates[torch.randperm(candidates.numel())[:n_extra]]
+                    tgt_mask = tgt_mask.clone()
+                    tgt_mask[extra] = True
+            ctx_mask = ~tgt_mask
             context_node_masks.append(ctx_mask)
             target_node_masks.append(tgt_mask)
 
@@ -149,4 +167,8 @@ def extract_subgraph(
         num_nodes=len(original_indices),
     )
     sub.original_indices = original_indices
+    # Same values under a name PyG batching leaves untouched: attributes whose
+    # name contains "index" (like original_indices) get offset per graph by
+    # Batch.from_data_list, which would corrupt atlas-region lookups.
+    sub.region_ids = original_indices
     return sub

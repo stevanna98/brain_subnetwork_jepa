@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import to_dense_batch
 
 
 class GPSLayer(nn.Module):
@@ -56,15 +57,26 @@ class GPSLayer(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Local branch
         h_local = self.mpnn(self.norm1(x), edge_index, edge_weight)
         h_local = F.dropout(h_local, p=self.dropout, training=self.training)
 
-        # Global branch — treat the N nodes as a sequence (batch size = 1)
-        h_norm = self.norm2(x).unsqueeze(0)  # (1, N, dim)
-        h_global, _ = self.attn(h_norm, h_norm, h_norm)
-        h_global = h_global.squeeze(0)
+        # Global branch — attention must stay within each graph: for a collated
+        # multi-subject batch, the `batch` vector scopes attention per subject.
+        h_norm = self.norm2(x)
+        if batch is None:
+            h_global, _ = self.attn(
+                h_norm.unsqueeze(0), h_norm.unsqueeze(0), h_norm.unsqueeze(0)
+            )
+            h_global = h_global.squeeze(0)
+        else:
+            dense, node_mask = to_dense_batch(h_norm, batch)  # (B, L, dim), (B, L)
+            attn_out, _ = self.attn(
+                dense, dense, dense, key_padding_mask=~node_mask
+            )
+            h_global = attn_out[node_mask]                    # back to (N, dim)
         h_global = F.dropout(h_global, p=self.dropout, training=self.training)
 
         x = x + h_local + h_global
@@ -123,16 +135,19 @@ class GraphTransformerEncoder(nn.Module):
         """
         x = self.input_proj(data.x)
         if self.region_embed is not None:
-            node_ids = getattr(
-                data, "original_indices",
-                torch.arange(data.num_nodes, device=x.device),
-            )
+            # region_ids (not original_indices): PyG batching offsets any
+            # attribute whose name contains "index", which would corrupt
+            # atlas-region lookups for batched subgraphs.
+            node_ids = getattr(data, "region_ids", None)
+            if node_ids is None:
+                node_ids = torch.arange(data.num_nodes, device=x.device)
             x = x + self.region_embed(node_ids)
         edge_index = data.edge_index
         edge_weight = data.edge_attr.squeeze(-1) if data.edge_attr is not None else None
+        batch = getattr(data, "batch", None)
 
         for layer in self.layers:
-            x = layer(x, edge_index, edge_weight)
+            x = layer(x, edge_index, edge_weight, batch)
 
         x = self.norm_out(self.output_proj(x))
         if self.normalize:

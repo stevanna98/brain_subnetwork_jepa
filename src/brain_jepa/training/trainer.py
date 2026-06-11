@@ -64,6 +64,7 @@ class Trainer:
         probe_evaluator: ProbeEvaluator | None = None,
         var_weight: float = 0.5,
         ctx_var_weight: float = 1.0,
+        cov_weight: float = 0.1,
         var_gamma: float = 0.1,
     ) -> None:
         self.model = model
@@ -78,6 +79,7 @@ class Trainer:
         self.probe_evaluator = probe_evaluator
         self._var_weight = var_weight
         self._ctx_var_weight = ctx_var_weight
+        self._cov_weight = cov_weight
         self._var_gamma = var_gamma
 
     # ------------------------------------------------------------------
@@ -131,10 +133,7 @@ class Trainer:
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
         self.model.train()
         total_loss = 0.0
-        total_sim = 0.0
-        total_ctx_var = 0.0
-        total_hat_var = 0.0
-        total_std = 0.0
+        running: dict[str, float] = {}
 
         for itr, raw_batch in enumerate(loader):
             t0 = time.time()
@@ -150,10 +149,11 @@ class Trainer:
             # Forward
             self.optimizer.zero_grad()
             z_hat, z_tgt, ctx_embs = self.model(batch, masks)
-            loss, sim_loss, ctx_var_loss, hat_var_loss, mean_std = jepa_loss(
+            loss, metrics = jepa_loss(
                 z_hat, z_tgt, ctx_embs,
                 var_weight=self._var_weight,
                 ctx_var_weight=self._ctx_var_weight,
+                cov_weight=self._cov_weight,
                 var_gamma=self._var_gamma,
             )
 
@@ -175,31 +175,20 @@ class Trainer:
             tau = self.ema_updater.step(self.model.context_encoder, self.model.target_encoder)
 
             total_loss += loss.item()
-            total_sim += sim_loss.item()
-            total_ctx_var += ctx_var_loss.item()
-            total_hat_var += hat_var_loss.item()
-            total_std += mean_std.item()
+            for k, v in metrics.items():
+                running[k] = running.get(k, 0.0) + v.item()
 
             if itr % self.log_freq == 0:
                 elapsed = time.time() - t0
+                metric_str = " | ".join(f"{k}={v.item():.4f}" for k, v in metrics.items())
                 logger.info(
-                    "Epoch %d | itr %d | loss=%.4f | sim=%.4f"
-                    " | ctx_var=%.4f | hat_var=%.4f | tgt_std=%.4f"
-                    " | lr=%.2e | tau=%.5f | %.1f ms",
-                    epoch, itr,
-                    loss.item(), sim_loss.item(),
-                    ctx_var_loss.item(), hat_var_loss.item(), mean_std.item(),
-                    lr, tau, elapsed * 1000,
+                    "Epoch %d | itr %d | loss=%.4f | %s | lr=%.2e | tau=%.5f | %.1f ms",
+                    epoch, itr, loss.item(), metric_str, lr, tau, elapsed * 1000,
                 )
 
         n = max(len(loader), 1)
-        logger.info(
-            "Epoch %d done | avg_loss=%.4f | avg_sim=%.4f"
-            " | avg_ctx_var=%.4f | avg_hat_var=%.4f | avg_tgt_std=%.4f",
-            epoch,
-            total_loss / n, total_sim / n,
-            total_ctx_var / n, total_hat_var / n, total_std / n,
-        )
+        avg_str = " | ".join(f"avg_{k}={v / n:.4f}" for k, v in running.items())
+        logger.info("Epoch %d done | avg_loss=%.4f | %s", epoch, total_loss / n, avg_str)
         return total_loss / n
 
     def _save_plots(

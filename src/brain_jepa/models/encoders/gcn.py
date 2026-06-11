@@ -70,10 +70,12 @@ class GCNEncoder(nn.Module):
         edge_weight = data.edge_attr.squeeze(-1) if data.edge_attr is not None else None
         x = self.input_proj(x)
         if self.region_embed is not None:
-            node_ids = getattr(
-                data, "original_indices",
-                torch.arange(data.num_nodes, device=x.device),
-            )
+            # region_ids (not original_indices): PyG batching offsets any
+            # attribute whose name contains "index", which would corrupt
+            # atlas-region lookups for batched subgraphs.
+            node_ids = getattr(data, "region_ids", None)
+            if node_ids is None:
+                node_ids = torch.arange(data.num_nodes, device=x.device)
             x = x + self.region_embed(node_ids)
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms, strict=True)):
             x = conv(x, edge_index, edge_weight)

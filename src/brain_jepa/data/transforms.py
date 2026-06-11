@@ -35,21 +35,29 @@ class PassthroughFeatures(nn.Module):
 
 
 class Conv1dFeatures(nn.Module):
-    """Temporal convolution to extract (N, F) features from (N, T) time series."""
+    """Two-layer temporal CNN extracting (N, F) features from (N, T) time series.
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 8) -> None:
+    Input time series are z-scored (zero mean), so a nonlinearity must precede
+    any temporal pooling: the time-average of a purely linear conv response of
+    a zero-mean signal collapses to the bias term. Mean and max pooling are
+    concatenated so the features capture both sustained spectral content and
+    transient events.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 7) -> None:
         super().__init__()
-        self.conv = nn.Conv1d(1, out_channels, kernel_size=kernel_size, stride=kernel_size // 2)
-        # Input time series are z-scored (zero mean): averaging a *linear* conv
-        # response over time would collapse to the bias term, so a nonlinearity
-        # must precede the temporal pooling for the features to carry signal.
-        self.act = nn.GELU()
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.proj = nn.Linear(out_channels, out_channels)
+        mid = max(out_channels // 2, 1)
+        self.net = nn.Sequential(
+            nn.Conv1d(1, mid, kernel_size=kernel_size, stride=2, padding=kernel_size // 2),
+            nn.GELU(),
+            nn.Conv1d(mid, out_channels, kernel_size=kernel_size, stride=2, padding=kernel_size // 2),
+            nn.GELU(),
+        )
+        self.proj = nn.Linear(2 * out_channels, out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.conv(x.unsqueeze(1)))  # (N, F, T')
-        h = self.pool(h).squeeze(-1)             # (N, F)
+        h = self.net(x.unsqueeze(1))                       # (N, F, T')
+        h = torch.cat([h.mean(dim=-1), h.amax(dim=-1)], dim=-1)  # (N, 2F)
         return self.proj(h)
 
 

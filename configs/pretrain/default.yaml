@@ -25,6 +25,7 @@ data:
 
 masking:
   num_targets: 1              # M — number of held-out subnetworks per sample
+  extra_target_ratio: 0.15    # fraction of remaining nodes also masked (task variety beyond the K RSN-level masks)
   include_cross_edges: false
 
 model:
@@ -52,6 +53,7 @@ training:
   clip_grad: 1.0
   var_weight: 0.5       # weight of predictor output variance term
   ctx_var_weight: 1.0  # weight of DIRECT context encoder variance term (key anti-collapse signal)
+  cov_weight: 0.1       # VICReg-style covariance penalty on context embeddings (prevents dimensional collapse)
   var_gamma: 0.1        # target std; dims below this are penalised
   ema_tau_start: 0.99
   ema_tau_end: 1.0

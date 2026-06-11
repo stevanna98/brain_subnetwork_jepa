@@ -107,47 +107,50 @@ class BSJEPA(nn.Module):
                       Has gradients — used for direct variance regularisation on
                       the context encoder without going through the predictor.
         """
-        data_list = batch.to_data_list()
-        B = len(data_list)
-
         if self.feature_extractor is not None:
-            for data_b in data_list:
-                data_b.x = self.feature_extractor(data_b.x)
+            batch.x = self.feature_extractor(batch.x)
 
-        z_hat_list: list[torch.Tensor] = []
-        z_tgt_list: list[torch.Tensor] = []
-        ctx_embs_list: list[torch.Tensor] = []
+        # Region identity for every node of the collated batch (nodes are
+        # atlas-ordered within each subject, so node index = region index).
+        counts = batch.ptr.diff()
+        batch.region_ids = torch.cat(
+            [torch.arange(int(c), device=batch.x.device) for c in counts]
+        )
 
-        for b in range(B):
-            data_b = data_list[b]
+        # ---- Target branch: one pass over the full collated batch ----
+        tgt_emb_full = self._encode_target(batch)               # (N_total, d)
+        global_tgt_mask = torch.cat(masks.target_node_masks)     # (N_total,)
+        z_tgt = tgt_emb_full[global_tgt_mask]                    # (N_tgt_total, d)
+        z_tgt = F.layer_norm(z_tgt, (z_tgt.shape[-1],))
+
+        # ---- Context branch: per-subject subgraphs, encoded as one batch ----
+        data_list = batch.to_data_list()
+        ctx_graphs: list[Data] = []
+        ctx_rsn_list: list[torch.Tensor] = []
+        ctx_region_list: list[torch.Tensor] = []
+        tgt_rsn_list: list[torch.Tensor] = []
+        tgt_region_list: list[torch.Tensor] = []
+
+        for b, data_b in enumerate(data_list):
             ctx_mask = masks.context_node_masks[b]
             tgt_mask = masks.target_node_masks[b]
+            ctx_graphs.append(extract_subgraph(data_b, ctx_mask))
+            ctx_rsn_list.append(data_b.rsn_ids[ctx_mask])
+            ctx_region_list.append(ctx_mask.nonzero(as_tuple=True)[0])
+            tgt_rsn_list.append(data_b.rsn_ids[tgt_mask])
+            tgt_region_list.append(tgt_mask.nonzero(as_tuple=True)[0])
 
-            # Context branch: drop target nodes, encode context subgraph → (N_ctx, d)
-            ctx_emb = self._encode_context(data_b, ctx_mask)       # (N_ctx, d)
-            ctx_node_rsn_ids = data_b.rsn_ids[ctx_mask]            # (N_ctx,)
-            # Nodes are atlas-ordered, so node index = region index
-            ctx_region_ids = ctx_mask.nonzero(as_tuple=True)[0]    # (N_ctx,)
+        ctx_batch = Batch.from_data_list(ctx_graphs)
+        ctx_embs = self.context_encoder(ctx_batch)               # (N_ctx_total, d)
+        ctx_sizes = [g.num_nodes for g in ctx_graphs]
+        ctx_split = list(ctx_embs.split(ctx_sizes, dim=0))
 
-            # Target branch: full graph, index target nodes → (N_tgt, d)
-            tgt_emb_full = self._encode_target(data_b)
-            tgt_emb = tgt_emb_full[tgt_mask]                        # (N_tgt, d)
-            tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]            # (N_tgt,)
-            tgt_region_ids = tgt_mask.nonzero(as_tuple=True)[0]    # (N_tgt,)
-            tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
-
-            z_hat_b = self.predictor(
-                ctx_emb, ctx_node_rsn_ids, ctx_region_ids,
-                tgt_node_rsn_ids, tgt_region_ids,
-            )
-
-            z_hat_list.append(z_hat_b)
-            z_tgt_list.append(tgt_emb)
-            ctx_embs_list.append(ctx_emb)
-
+        # ---- Predictor: single padded Transformer call over all subjects ----
+        z_hat_list = self.predictor.forward_batched(
+            ctx_split, ctx_rsn_list, ctx_region_list,
+            tgt_rsn_list, tgt_region_list,
+        )
         z_hat = torch.cat(z_hat_list, dim=0)       # (N_tgt_total, d)
-        z_tgt = torch.cat(z_tgt_list, dim=0)       # (N_tgt_total, d)
-        ctx_embs = torch.cat(ctx_embs_list, dim=0) # (N_ctx_total, d)
 
         return z_hat, z_tgt.detach(), ctx_embs
 

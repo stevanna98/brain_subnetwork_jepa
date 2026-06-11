@@ -78,6 +78,46 @@ def test_variable_num_targets(atlas, synthetic_dataset, num_targets):
     assert masks.context_rsn_ids.shape == (4, NUM_RSNS - num_targets)
 
 
+def test_extra_target_ratio(atlas, synthetic_dataset):
+    """Extra random nodes are masked on top of the target RSN; the node masks
+    still partition all nodes and target counts vary across samples."""
+    ratio = 0.15
+    collator = SubnetworkMaskCollator(
+        num_rsns=NUM_RSNS, num_targets=1, extra_target_ratio=ratio
+    )
+    batch = [synthetic_dataset[i] for i in range(4)]
+    _, masks = collator(batch)
+    for b in range(4):
+        tgt_mask = masks.target_node_masks[b]
+        ctx_mask = masks.context_node_masks[b]
+        rsn_ids = batch[b].rsn_ids
+        # Still disjoint and covering
+        assert not (tgt_mask & ctx_mask).any()
+        assert (tgt_mask | ctx_mask).all()
+        # All target-RSN nodes are masked...
+        rsn_tgt = torch.isin(rsn_ids, masks.target_rsn_ids[b])
+        assert tgt_mask[rsn_tgt].all()
+        # ...plus approximately ratio * remaining extra nodes
+        n_extra = int(tgt_mask.sum()) - int(rsn_tgt.sum())
+        expected = round(ratio * int((~rsn_tgt).sum()))
+        assert n_extra == expected
+
+
+def test_extra_targets_differ_across_samples(atlas, synthetic_dataset):
+    """With extra random targets, two samples masking the same RSN should
+    still have different target node sets (task variety)."""
+    collator = SubnetworkMaskCollator(
+        num_rsns=NUM_RSNS, num_targets=1, extra_target_ratio=0.15
+    )
+    data = synthetic_dataset[0]
+    torch.manual_seed(0)
+    _, masks_a = collator([data, data])
+    # Same subject twice — extras are sampled independently per subject
+    a, b = masks_a.target_node_masks
+    if masks_a.target_rsn_ids[0].item() == masks_a.target_rsn_ids[1].item():
+        assert not torch.equal(a, b)
+
+
 def test_atlas_region_count(atlas):
     assert atlas.num_regions == NUM_REGIONS
 

@@ -199,18 +199,30 @@ def test_ema_schedule_monotone():
 # ------------------------------------------------------------------
 
 def test_jepa_loss_perfect_prediction():
-    """With z_hat == z_tgt and ample variance, the loss should be ~0."""
+    """With z_hat == z_tgt and ample variance, the sim loss should be ~0."""
     x = torch.randn(64, D)
-    total, sim, ctx_var, hat_var, tgt_std = jepa_loss(x, x.detach(), x.detach())
-    assert sim.item() == pytest.approx(0.0, abs=1e-5)
+    total, metrics = jepa_loss(x, x.detach(), x.detach())
+    assert metrics["sim"].item() == pytest.approx(0.0, abs=1e-5)
 
 
 def test_jepa_loss_nonnegative():
     z_hat = torch.randn(64, D)
     z_tgt = torch.randn(64, D)
     ctx = torch.randn(128, D)
-    total, *_ = jepa_loss(z_hat, z_tgt.detach(), ctx)
+    total, metrics = jepa_loss(z_hat, z_tgt.detach(), ctx)
     assert total.item() >= 0.0
+    assert set(metrics) == {"sim", "ctx_var", "hat_var", "ctx_cov", "tgt_std"}
+
+
+def test_jepa_loss_covariance_penalises_correlated_dims():
+    """Embeddings with perfectly correlated dimensions should pay a cov penalty."""
+    base = torch.randn(128, 1)
+    correlated = base.expand(128, D)  # rank-1: all dims identical
+    decorrelated = torch.randn(128, D)
+    z = torch.randn(32, D)
+    _, m_corr = jepa_loss(z, z.detach(), correlated)
+    _, m_decorr = jepa_loss(z, z.detach(), decorrelated)
+    assert m_corr["ctx_cov"].item() > m_decorr["ctx_cov"].item()
 
 
 def test_jepa_loss_backward(model, batch_and_masks):
@@ -218,9 +230,46 @@ def test_jepa_loss_backward(model, batch_and_masks):
     batch, masks = batch_and_masks
     model.train()
     z_hat, z_tgt, ctx_embs = model(batch, masks)
-    total, *_ = jepa_loss(z_hat, z_tgt, ctx_embs)
+    total, _ = jepa_loss(z_hat, z_tgt, ctx_embs)
     total.backward()
     # At least some gradient should be non-zero
     grads = [p.grad for p in model.context_encoder.parameters() if p.grad is not None]
     assert len(grads) > 0
     assert any(g.abs().sum() > 0 for g in grads)
+
+
+# ------------------------------------------------------------------
+# Batched vs per-subject equivalence
+# ------------------------------------------------------------------
+
+def test_batched_forward_matches_per_subject(model, batch_and_masks, dataset):
+    """The batched forward must reproduce per-subject computation exactly."""
+    import torch.nn.functional as TF
+
+    from brain_jepa.masking.subnetwork_masking import extract_subgraph
+
+    batch, masks = batch_and_masks
+    model.eval()
+    with torch.no_grad():
+        z_hat, z_tgt, ctx_embs = model(batch, masks)
+
+        # Reference: encode and predict one subject at a time
+        z_hat_ref, z_tgt_ref = [], []
+        for b, data_b in enumerate(batch.to_data_list()):
+            ctx_mask = masks.context_node_masks[b]
+            tgt_mask = masks.target_node_masks[b]
+            ctx_emb = model.context_encoder(extract_subgraph(data_b, ctx_mask))
+            tgt_emb = model.target_encoder(data_b)[tgt_mask]
+            tgt_emb = TF.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
+            pred = model.predictor(
+                ctx_emb,
+                data_b.rsn_ids[ctx_mask],
+                ctx_mask.nonzero(as_tuple=True)[0],
+                data_b.rsn_ids[tgt_mask],
+                tgt_mask.nonzero(as_tuple=True)[0],
+            )
+            z_hat_ref.append(pred)
+            z_tgt_ref.append(tgt_emb)
+
+    assert torch.allclose(z_hat, torch.cat(z_hat_ref), atol=1e-4)
+    assert torch.allclose(z_tgt, torch.cat(z_tgt_ref), atol=1e-4)

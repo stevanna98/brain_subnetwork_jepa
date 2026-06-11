@@ -151,11 +151,38 @@ def main() -> None:
     mask_collator = SubnetworkMaskCollator(
         num_rsns=atlas.num_rsns,
         num_targets=int(cfg.masking.num_targets),
+        extra_target_ratio=float(cfg.masking.get("extra_target_ratio", 0.0)),
         include_cross_edges_in_context=bool(cfg.masking.include_cross_edges),
     )
 
+    # Probe subjects are held out from pretraining so probe metrics measure
+    # generalisation to unseen subjects, not memorisation.
+    probe_cfg = cfg.get("probe", {})
+    probe_freq = int(probe_cfg.get("freq", 10))
+    probe_indices: list[int] = []
+    if not cfg.data.get("synthetic", False) and probe_freq > 0:
+        requested = int(probe_cfg.get("num_subjects", min(200, len(dataset))))
+        probe_size = min(requested, len(dataset) // 2)
+        if probe_size < requested:
+            logger.warning(
+                "Capping probe set at half the dataset: %d subjects", probe_size
+            )
+        g = torch.Generator().manual_seed(int(cfg.meta.seed))
+        probe_indices = torch.randperm(len(dataset), generator=g)[:probe_size].tolist()
+
+    if probe_indices:
+        probe_set = set(probe_indices)
+        train_indices = [i for i in range(len(dataset)) if i not in probe_set]
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        logger.info(
+            "Subject split: %d pretraining / %d probe (held out)",
+            len(train_indices), len(probe_indices),
+        )
+    else:
+        train_dataset = dataset
+
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=int(cfg.data.batch_size),
         shuffle=True,
         num_workers=int(cfg.data.num_workers),
@@ -218,14 +245,9 @@ def main() -> None:
         total_steps=total_steps,
     )
 
-    # Probe evaluator — uses a random subset of the training dataset
+    # Probe evaluator — uses the held-out probe subjects selected above
     probe_evaluator = None
-    probe_cfg = cfg.get("probe", {})
-    probe_freq = int(probe_cfg.get("freq", 10))
-    if not cfg.data.get("synthetic", False) and probe_freq > 0:
-        probe_size = int(probe_cfg.get("num_subjects", min(200, len(dataset))))
-        g = torch.Generator().manual_seed(int(cfg.meta.seed))
-        probe_indices = torch.randperm(len(dataset), generator=g)[:probe_size].tolist()
+    if probe_indices:
         probe_subset = torch.utils.data.Subset(dataset, probe_indices)
         probe_loader = DataLoader(
             probe_subset,
@@ -242,7 +264,10 @@ def main() -> None:
             lr=float(probe_cfg.get("lr", 1e-3)),
             seed=int(cfg.meta.seed),
         )
-        logger.info("ProbeEvaluator: %d subjects, every %d epochs", probe_size, probe_freq)
+        logger.info(
+            "ProbeEvaluator: %d held-out subjects, every %d epochs",
+            len(probe_indices), probe_freq,
+        )
 
     trainer = Trainer(
         model=model,
@@ -257,6 +282,7 @@ def main() -> None:
         probe_evaluator=probe_evaluator,
         var_weight=float(cfg.training.get("var_weight", 0.5)),
         ctx_var_weight=float(cfg.training.get("ctx_var_weight", 1.0)),
+        cov_weight=float(cfg.training.get("cov_weight", 0.1)),
         var_gamma=float(cfg.training.get("var_gamma", 0.1)),
     )
 
