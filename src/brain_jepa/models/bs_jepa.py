@@ -2,9 +2,8 @@
 
 Forward pass overview
 ---------------------
-1. For each subject in the batch, zero the node features of target-RSN nodes
-   and run the *context encoder* on the full graph → (N, d).  Index context
-   nodes → (N_ctx, d).  Full edge structure is preserved; no subgraph extraction.
+1. For each subject in the batch, extract the induced subgraph on context-RSN nodes
+   (target nodes are dropped entirely) and run the *context encoder* → (N_ctx, d).
 2. Run the *target encoder* (EMA copy, no-grad) on the full graph → (N, d);
    index target-RSN nodes → (N_tgt, d).  No pooling.
 3. Run the *predictor* with all context node embeddings + one mask token per
@@ -26,7 +25,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 
 from ..data.atlas import AtlasMapping
-from ..masking.subnetwork_masking import MaskOutput
+from ..masking.subnetwork_masking import MaskOutput, extract_subgraph
 from .encoders import GCNEncoder, GraphTransformerEncoder
 from .predictor import SubnetworkPredictor
 
@@ -71,16 +70,13 @@ class BSJEPA(nn.Module):
         # representations capture inter-network context, not just intra-RSN structure.
         return self.target_encoder(data)
 
-    def _encode_context(self, data: Data, tgt_mask: torch.Tensor) -> torch.Tensor:
-        """Zero target-node features and run the context encoder on the full graph.
+    def _encode_context(self, data: Data, ctx_mask: torch.Tensor) -> torch.Tensor:
+        """Extract the context subgraph (dropping target nodes) and encode it.
 
-        Returns full-graph node embeddings (N, d).  The caller indexes context
-        nodes from the result; the full edge structure is preserved.
+        Returns context node embeddings (N_ctx, d).
         """
-        masked = data.clone()
-        masked.x = data.x.clone()
-        masked.x[tgt_mask] = 0.0
-        return self.context_encoder(masked)  # (N, d)
+        ctx_graph = extract_subgraph(data, ctx_mask)
+        return self.context_encoder(ctx_graph)  # (N_ctx, d)
 
     @torch.no_grad()
     def encode(self, data: Data) -> torch.Tensor:
@@ -127,18 +123,23 @@ class BSJEPA(nn.Module):
             ctx_mask = masks.context_node_masks[b]
             tgt_mask = masks.target_node_masks[b]
 
-            # Context branch: zero target features, encode full graph, index context nodes
-            ctx_full_emb = self._encode_context(data_b, tgt_mask)  # (N, d)
-            ctx_emb = ctx_full_emb[ctx_mask]                        # (N_ctx, d)
+            # Context branch: drop target nodes, encode context subgraph → (N_ctx, d)
+            ctx_emb = self._encode_context(data_b, ctx_mask)       # (N_ctx, d)
             ctx_node_rsn_ids = data_b.rsn_ids[ctx_mask]            # (N_ctx,)
+            # Nodes are atlas-ordered, so node index = region index
+            ctx_region_ids = ctx_mask.nonzero(as_tuple=True)[0]    # (N_ctx,)
 
             # Target branch: full graph, index target nodes → (N_tgt, d)
             tgt_emb_full = self._encode_target(data_b)
             tgt_emb = tgt_emb_full[tgt_mask]                        # (N_tgt, d)
             tgt_node_rsn_ids = data_b.rsn_ids[tgt_mask]            # (N_tgt,)
+            tgt_region_ids = tgt_mask.nonzero(as_tuple=True)[0]    # (N_tgt,)
             tgt_emb = F.layer_norm(tgt_emb, (tgt_emb.shape[-1],))
 
-            z_hat_b = self.predictor(ctx_emb, ctx_node_rsn_ids, tgt_node_rsn_ids)
+            z_hat_b = self.predictor(
+                ctx_emb, ctx_node_rsn_ids, ctx_region_ids,
+                tgt_node_rsn_ids, tgt_region_ids,
+            )
 
             z_hat_list.append(z_hat_b)
             z_tgt_list.append(tgt_emb)
@@ -195,6 +196,7 @@ def build_bsjepa(
         encoder_dim=encoder_out,
         predictor_dim=predictor_dim,
         num_rsns=atlas.num_rsns,
+        num_regions=atlas.num_regions,
         depth=predictor_depth,
         num_heads=predictor_heads,
         dropout=predictor_dropout,

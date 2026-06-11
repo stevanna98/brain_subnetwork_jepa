@@ -34,7 +34,7 @@ def jepa_loss(
         var_gamma:     Target std; dims below this are penalised.
 
     Returns:
-        (total, sim_loss, hat_var_loss, ctx_var_loss, tgt_std) — all scalars.
+        (total, sim_loss, ctx_var_loss, hat_var_loss, tgt_std) — all scalars.
     """
     # Cosine similarity loss
     z_hat_n = F.normalize(z_hat, dim=-1)

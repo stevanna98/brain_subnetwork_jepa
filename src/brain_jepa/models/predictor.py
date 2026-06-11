@@ -20,6 +20,7 @@ class SubnetworkPredictor(nn.Module):
         encoder_dim: Output dimension d of the encoder.
         predictor_dim: Internal predictor width (should be < encoder_dim).
         num_rsns: Number of distinct subnetwork identities K.
+        num_regions: Number of atlas regions (one identity embedding per node).
         depth: Number of Transformer encoder layers.
         num_heads: Attention heads.
         mlp_ratio: FFN hidden expansion factor.
@@ -31,6 +32,7 @@ class SubnetworkPredictor(nn.Module):
         encoder_dim: int,
         predictor_dim: int = 384,
         num_rsns: int = 12,
+        num_regions: int = 379,
         depth: int = 6,
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
@@ -45,6 +47,11 @@ class SubnetworkPredictor(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, predictor_dim))
         # Per-RSN identity embedding used for both context and target tokens
         self.rsn_embed = nn.Embedding(num_rsns, predictor_dim)
+        # Per-region identity embedding (analog of I-JEPA's positional embedding
+        # on mask tokens). Without it, all mask queries for one target RSN are
+        # identical tokens and self-attention maps them to identical outputs —
+        # the predictor can then only emit a single shared vector per RSN.
+        self.region_embed = nn.Embedding(num_regions, predictor_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=predictor_dim,
@@ -66,6 +73,7 @@ class SubnetworkPredictor(nn.Module):
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.normal_(self.rsn_embed.weight, std=0.02)
+        nn.init.normal_(self.region_embed.weight, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
@@ -76,14 +84,18 @@ class SubnetworkPredictor(nn.Module):
         self,
         context_tokens: torch.Tensor,
         context_rsn_ids: torch.Tensor,
+        context_region_ids: torch.Tensor,
         target_node_rsn_ids: torch.Tensor,
+        target_region_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Predict node-level target representations for one subject.
 
         Args:
             context_tokens:      (N_ctx, encoder_dim) context node embeddings.
             context_rsn_ids:     (N_ctx,) RSN index for each context node.
+            context_region_ids:  (N_ctx,) atlas region index for each context node.
             target_node_rsn_ids: (N_tgt,) RSN index for each target node.
+            target_region_ids:   (N_tgt,) atlas region index for each target node.
 
         Returns:
             Predicted node embeddings, shape (N_tgt, encoder_dim).
@@ -91,15 +103,19 @@ class SubnetworkPredictor(nn.Module):
         K_c = context_tokens.shape[0]
         N_tgt = target_node_rsn_ids.shape[0]
 
-        # Context: project + add RSN identity
-        ctx = self.input_proj(context_tokens)           # (K_c, P)
-        ctx = ctx + self.rsn_embed(context_rsn_ids)     # (K_c, P)
+        # Context: project + add RSN and region identities
+        ctx = self.input_proj(context_tokens)               # (K_c, P)
+        ctx = ctx + self.rsn_embed(context_rsn_ids)         # (K_c, P)
+        ctx = ctx + self.region_embed(context_region_ids)   # (K_c, P)
 
-        # Target: one mask token per node, tagged with its RSN identity.
-        # RSN embedding is detached to cut the gradient path that would allow
-        # the predictor to cheat by memorising a fixed per-RSN direction.
+        # Target: one mask token per node, tagged with its RSN and region
+        # identities so each query is unique. Identity embeddings are detached
+        # on the target side to cut the gradient path that would let the
+        # predictor tune them into per-node answer codes; they still train
+        # through the context side.
         mask = self.mask_token.expand(N_tgt, -1)                        # (N_tgt, P)
         mask = mask + self.rsn_embed(target_node_rsn_ids).detach()      # (N_tgt, P)
+        mask = mask + self.region_embed(target_region_ids).detach()     # (N_tgt, P)
 
         # Run Transformer over context + target tokens (add batch dim)
         seq = torch.cat([ctx, mask], dim=0).unsqueeze(0)  # (1, K_c + N_tgt, P)

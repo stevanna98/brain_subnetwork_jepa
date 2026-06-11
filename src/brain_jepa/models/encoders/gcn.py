@@ -45,8 +45,12 @@ class GCNEncoder(nn.Module):
         )
 
         dims = [hidden_channels] * num_layers + [out_channels]
+        # Self-loops are required here: there is no residual path in this stack,
+        # so without them each layer discards the node's own representation and
+        # nodes within a densely connected subnetwork smooth into near-identical
+        # embeddings. Requires non-negative edge weights (top_k clamps them).
         self.convs = nn.ModuleList(
-            [GCNConv(dims[i], dims[i + 1], add_self_loops=False) for i in range(num_layers)]
+            [GCNConv(dims[i], dims[i + 1], add_self_loops=True) for i in range(num_layers)]
         )
         self.norms = nn.ModuleList(
             [nn.LayerNorm(dims[i + 1]) for i in range(num_layers)]

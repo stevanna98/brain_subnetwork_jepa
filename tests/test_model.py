@@ -41,7 +41,6 @@ def model(atlas):
         encoder_hidden=64,
         encoder_out=D,
         encoder_layers=2,
-        pooling_mode="mean",
         predictor_dim=32,
         predictor_depth=2,
         predictor_heads=2,
@@ -97,15 +96,44 @@ def test_pooling_shape(atlas, PoolCls):
 # ------------------------------------------------------------------
 
 def test_predictor_output_shape():
-    B, K_c, M, D_enc, P = 4, 11, 1, D, 32
-    pred = SubnetworkPredictor(encoder_dim=D_enc, predictor_dim=P, num_rsns=K, depth=2, num_heads=2)
+    N_ctx, N_tgt, D_enc, P = 340, 39, D, 32
+    pred = SubnetworkPredictor(
+        encoder_dim=D_enc, predictor_dim=P, num_rsns=K, num_regions=N, depth=2, num_heads=2
+    )
     pred.eval()
-    context_tokens = torch.randn(B, K_c, D_enc)
-    context_rsn_ids = torch.stack([torch.randperm(K)[:K_c] for _ in range(B)])
-    target_rsn_ids = torch.stack([torch.randperm(K)[K_c : K_c + M] for _ in range(B)])
+    context_tokens = torch.randn(N_ctx, D_enc)
+    context_rsn_ids = torch.randint(0, K, (N_ctx,))
+    context_region_ids = torch.arange(N_ctx)
+    target_rsn_ids = torch.randint(0, K, (N_tgt,))
+    target_region_ids = torch.arange(N_ctx, N_ctx + N_tgt)
     with torch.no_grad():
-        out = pred(context_tokens, context_rsn_ids, target_rsn_ids)
-    assert out.shape == (B, M, D_enc)
+        out = pred(
+            context_tokens, context_rsn_ids, context_region_ids,
+            target_rsn_ids, target_region_ids,
+        )
+    assert out.shape == (N_tgt, D_enc)
+
+
+def test_predictor_distinct_outputs_within_rsn():
+    """Mask queries within one RSN must yield distinct node-level predictions."""
+    N_ctx, N_tgt, D_enc, P = 340, 39, D, 32
+    pred = SubnetworkPredictor(
+        encoder_dim=D_enc, predictor_dim=P, num_rsns=K, num_regions=N, depth=2, num_heads=2
+    )
+    pred.eval()
+    context_tokens = torch.randn(N_ctx, D_enc)
+    context_rsn_ids = torch.randint(0, K, (N_ctx,))
+    context_region_ids = torch.arange(N_ctx)
+    # All target nodes belong to the same RSN
+    target_rsn_ids = torch.zeros(N_tgt, dtype=torch.long)
+    target_region_ids = torch.arange(N_ctx, N_ctx + N_tgt)
+    with torch.no_grad():
+        out = pred(
+            context_tokens, context_rsn_ids, context_region_ids,
+            target_rsn_ids, target_region_ids,
+        )
+    # Predictions for different nodes of the same RSN must not be identical
+    assert not torch.allclose(out[0], out[1], atol=1e-5)
 
 
 # ------------------------------------------------------------------
@@ -116,11 +144,13 @@ def test_bsjepa_forward_shapes(model, batch_and_masks):
     batch, masks = batch_and_masks
     model.eval()
     with torch.no_grad():
-        z_hat, z_tgt = model(batch, masks)
-    B = len(batch.to_data_list())
-    M = masks.target_rsn_ids.shape[1]
-    assert z_hat.shape == (B, M, D)
-    assert z_tgt.shape == (B, M, D)
+        z_hat, z_tgt, ctx_embs = model(batch, masks)
+    n_tgt_total = sum(int(m.sum()) for m in masks.target_node_masks)
+    n_ctx_total = sum(int(m.sum()) for m in masks.context_node_masks)
+    assert z_hat.shape == (n_tgt_total, D)
+    assert z_tgt.shape == (n_tgt_total, D)
+    assert ctx_embs.shape == (n_ctx_total, D)
+    assert not z_tgt.requires_grad
 
 
 def test_bsjepa_no_grad_on_target(model):
@@ -168,25 +198,28 @@ def test_ema_schedule_monotone():
 # Loss
 # ------------------------------------------------------------------
 
-def test_jepa_loss_zero():
-    x = torch.randn(4, 1, D)
-    assert jepa_loss(x, x.detach()) == pytest.approx(0.0, abs=1e-6)
+def test_jepa_loss_perfect_prediction():
+    """With z_hat == z_tgt and ample variance, the loss should be ~0."""
+    x = torch.randn(64, D)
+    total, sim, ctx_var, hat_var, tgt_std = jepa_loss(x, x.detach(), x.detach())
+    assert sim.item() == pytest.approx(0.0, abs=1e-5)
 
 
 def test_jepa_loss_nonnegative():
-    z_hat = torch.randn(4, 1, D)
-    z_tgt = torch.randn(4, 1, D)
-    loss = jepa_loss(z_hat, z_tgt.detach())
-    assert loss.item() >= 0.0
+    z_hat = torch.randn(64, D)
+    z_tgt = torch.randn(64, D)
+    ctx = torch.randn(128, D)
+    total, *_ = jepa_loss(z_hat, z_tgt.detach(), ctx)
+    assert total.item() >= 0.0
 
 
 def test_jepa_loss_backward(model, batch_and_masks):
     """Loss should be differentiable w.r.t. encoder and predictor parameters."""
     batch, masks = batch_and_masks
     model.train()
-    z_hat, z_tgt = model(batch, masks)
-    loss = jepa_loss(z_hat, z_tgt)
-    loss.backward()
+    z_hat, z_tgt, ctx_embs = model(batch, masks)
+    total, *_ = jepa_loss(z_hat, z_tgt, ctx_embs)
+    total.backward()
     # At least some gradient should be non-zero
     grads = [p.grad for p in model.context_encoder.parameters() if p.grad is not None]
     assert len(grads) > 0
