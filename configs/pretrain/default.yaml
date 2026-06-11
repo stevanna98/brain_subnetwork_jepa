@@ -54,7 +54,7 @@ training:
   var_weight: 0.5       # weight of predictor output variance term
   ctx_var_weight: 1.0  # weight of DIRECT context encoder variance term (key anti-collapse signal)
   cov_weight: 0.1       # VICReg-style covariance penalty on context embeddings (prevents dimensional collapse)
-  var_gamma: 0.1        # target std; dims below this are penalised
+  var_gamma: 0.25       # target std floor; raised from 0.1 because embeddings were pinning at the 0.1 floor (weak dispersion)
   ema_tau_start: 0.99
   ema_tau_end: 1.0
 

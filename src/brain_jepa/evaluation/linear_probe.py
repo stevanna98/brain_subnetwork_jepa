@@ -217,72 +217,89 @@ def extract_representations_with_labels(
 class ProbeEvaluator:
     """Periodically evaluates representation quality via age regression and gender classification.
 
-    A fresh probe is fitted from scratch at every call, so the frozen encoder
-    is the only thing being measured.
+    Uses the standard frozen-feature linear-probe protocol from the SSL
+    literature: features are standardised, and a *closed-form* regularised
+    linear model is fitted with k-fold cross-validation. Cross-validated
+    metrics on a small held-out set are far less noisy than a single
+    SGD-trained probe on one train/test split (which is what produced
+    R²=-10 / acc=0.5 earlier: unstandardised targets + an under-fit AdamW
+    probe on ~40 subjects).
 
     Args:
-        loader:       DataLoader over a labeled subset (subjects with age/gender).
-        device:       Torch device.
-        train_frac:   Fraction of subjects used to fit the probe (rest is test).
-        num_epochs:   Training epochs for each probe.
-        lr:           Learning rate for the probe optimiser.
-        seed:         RNG seed for the train/test split.
+        loader:    DataLoader over the held-out labeled subjects.
+        device:    Torch device.
+        n_splits:  Number of cross-validation folds.
+        seed:      RNG seed for the CV split.
     """
 
     def __init__(
         self,
         loader: DataLoader,
         device: torch.device,
+        n_splits: int = 5,
+        seed: int = 0,
+        # accepted for backwards-compat with existing configs; unused
         train_frac: float = 0.8,
         num_epochs: int = 50,
         lr: float = 1e-3,
-        seed: int = 0,
     ) -> None:
         self.loader = loader
         self.device = device
-        self.train_frac = train_frac
-        self.num_epochs = num_epochs
-        self.lr = lr
+        self.n_splits = n_splits
         self.seed = seed
 
     def evaluate(self, model: BSJEPA) -> dict[str, float]:
-        """Extract embeddings, fit probes, return metrics dict."""
+        """Extract embeddings, fit cross-validated linear probes, return metrics."""
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression, RidgeCV
+        from sklearn.model_selection import StratifiedKFold, cross_val_predict
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
         features, ages, genders = extract_representations_with_labels(
             model, self.loader, self.device
         )
-
-        n = len(features)
-        g = torch.Generator().manual_seed(self.seed)
-        perm = torch.randperm(n, generator=g)
-        split = max(1, int(self.train_frac * n))
-        tr, te = perm[:split], perm[split:]
-
+        X = features.numpy()
         results: dict[str, float] = {}
 
         if ages is not None:
-            probe = RegressionProbe(features.shape[1])
-            probe.fit(
-                features[tr], ages[tr],
-                num_epochs=self.num_epochs, lr=self.lr, device=self.device,
+            y = ages.numpy()
+            k = min(self.n_splits, len(y))
+            reg = make_pipeline(
+                StandardScaler(),
+                RidgeCV(alphas=np.logspace(-2, 4, 13)),
             )
-            metrics = probe.evaluate(features[te].to(self.device), ages[te].to(self.device))
-            results.update({f"age_{k}": v for k, v in metrics.items()})
+            preds = cross_val_predict(reg, X, y, cv=k)
+            ss_res = float(((y - preds) ** 2).sum())
+            ss_tot = float(((y - y.mean()) ** 2).sum())
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            mae = float(np.abs(y - preds).mean())
+            pearson = float(np.corrcoef(preds, y)[0, 1]) if len(y) > 1 else 0.0
+            results.update({"age_r2": r2, "age_mae": mae, "age_pearson_r": pearson})
             logger.info(
-                "ProbeEval | age R²=%.4f | Pearson r=%.4f",
-                metrics["r2"], metrics["pearson_r"],
+                "ProbeEval | age R²=%.4f | Pearson r=%.4f | MAE=%.3f", r2, pearson, mae
             )
 
         if genders is not None:
-            num_classes = int(genders.max().item()) + 1
-            probe_cls = LinearProbe(features.shape[1], num_classes=num_classes)
-            probe_cls.fit(
-                features[tr], genders[tr],
-                num_epochs=self.num_epochs, lr=self.lr, device=self.device,
-            )
-            metrics_cls = probe_cls.evaluate(
-                features[te].to(self.device), genders[te].to(self.device)
-            )
-            results.update({f"gender_{k}": v for k, v in metrics_cls.items()})
-            logger.info("ProbeEval | gender acc=%.4f", metrics_cls["accuracy"])
+            y = genders.numpy()
+            classes, counts = np.unique(y, return_counts=True)
+            majority = counts.max() / counts.sum()
+            if len(classes) < 2 or counts.min() < 2:
+                logger.warning(
+                    "ProbeEval | gender: too few samples per class, skipping"
+                )
+            else:
+                k = int(min(self.n_splits, counts.min()))
+                clf = make_pipeline(
+                    StandardScaler(),
+                    LogisticRegression(max_iter=2000, C=1.0),
+                )
+                cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=self.seed)
+                preds = cross_val_predict(clf, X, y, cv=cv)
+                acc = float((preds == y).mean())
+                results.update({"gender_accuracy": acc, "gender_majority": float(majority)})
+                logger.info(
+                    "ProbeEval | gender acc=%.4f (majority baseline=%.4f)", acc, majority
+                )
 
         return results
