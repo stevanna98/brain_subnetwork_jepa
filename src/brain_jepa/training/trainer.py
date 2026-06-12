@@ -23,9 +23,10 @@ except ImportError:
 from ..evaluation.diagnostics import (
     CollapseThresholds,
     collapse_warnings,
+    pooled_embeddings,
     representation_health,
 )
-from ..evaluation.linear_probe import ProbeEvaluator, extract_representations
+from ..evaluation.linear_probe import ProbeEvaluator
 from ..masking.subnetwork_masking import SubnetworkMaskCollator
 from ..models.bs_jepa import BSJEPA
 from .ema import EMAUpdater
@@ -48,6 +49,8 @@ _LOG_FIELDS = [
     "embedding_std_min",
     "mean_pairwise_cosine",
     "effective_rank",
+    "node_embedding_std_mean",
+    "within_subject_node_std_mean",
     "grad_norm",
     "lr",
     "ema_tau",
@@ -306,9 +309,17 @@ class Trainer:
 
     @torch.no_grad()
     def _run_diagnostics(self, val_loader: DataLoader) -> dict[str, float]:
-        """Extract frozen target-encoder embeddings and return health metrics."""
-        features, _ = extract_representations(self.model, val_loader, self.device)
-        return representation_health(features)
+        """Mean-pooled subject-embedding health + node-level localisation metrics.
+
+        ``node_embedding_std_mean`` vs ``embedding_std_mean`` tells you whether a
+        collapse is inside the encoder (both ~0) or only after pooling (node std
+        healthy, subject std ~0).
+        """
+        pooled = pooled_embeddings(self.model, val_loader, self.device)
+        metrics = representation_health(pooled["mean"])
+        metrics["node_embedding_std_mean"] = pooled["node_embedding_std_mean"]
+        metrics["within_subject_node_std_mean"] = pooled["within_subject_node_std_mean"]
+        return metrics
 
     def _round_row(self, row: dict[str, float]) -> dict[str, float]:
         """Round float values for compact logging."""

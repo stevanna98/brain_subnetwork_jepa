@@ -4,7 +4,7 @@ meta:
 data:
   atlas_csv: /content/drive/MyDrive/IMPERIAL/data/glasser379_to_rsn12.csv
   dict_file: /content/drive/MyDrive/IMPERIAL/data/subject_data_1_cleaned_precise_age.pkl                        # path to your .pkl subject dict
-  feature_mode: passthrough               # must match what was used during pretraining
+  feature_mode: conv1d               # must match what was used during pretraining
   feature_dim: 64
   bold_key: BOLD
   fc_key: FC

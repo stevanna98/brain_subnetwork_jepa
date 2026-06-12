@@ -47,6 +47,10 @@ class SubnetworkPredictor(nn.Module):
         self.encoder_dim = encoder_dim
         self.predictor_dim = predictor_dim
         self.num_rsns = num_rsns
+        # Diagnostic-only switch: when True, target mask tokens carry no RSN/region
+        # identity. Lets a smoke run test whether the predictor is leaning on the
+        # target identity as a shortcut. Off by default — does not affect training.
+        self.disable_target_identity = False
 
         self.input_proj = nn.Linear(encoder_dim, predictor_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, predictor_dim))
@@ -106,8 +110,9 @@ class SubnetworkPredictor(nn.Module):
         # through the context side.
         n_tgt = target_node_rsn_ids.shape[0]
         mask = self.mask_token.expand(n_tgt, -1)                        # (N_tgt, P)
-        mask = mask + self.rsn_embed(target_node_rsn_ids).detach()      # (N_tgt, P)
-        mask = mask + self.region_embed(target_region_ids).detach()     # (N_tgt, P)
+        if not self.disable_target_identity:
+            mask = mask + self.rsn_embed(target_node_rsn_ids).detach()      # (N_tgt, P)
+            mask = mask + self.region_embed(target_region_ids).detach()     # (N_tgt, P)
 
         return torch.cat([ctx, mask], dim=0)
 

@@ -9,8 +9,8 @@ data:
   synthetic: false
   num_synthetic_subjects: 64
   # --- features ---
-  node_feature_type: ones  # bold | fc_row | ones
-  feature_mode: passthrough     # passthrough | conv1d  (only used when node_feature_type=bold)
+  node_feature_type: bold  # bold | fc_row | ones
+  feature_mode: conv1d     # passthrough | conv1d  (only used when node_feature_type=bold)
   feature_dim: 64          # (only used when node_feature_type=bold)
   bold_key: BOLD              # key for time-series inside each subject dict (FCDictDataset only)
   fc_key: FC                  # key for FC matrix inside each subject dict (FCDictDataset only)
