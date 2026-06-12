@@ -247,6 +247,7 @@ def main() -> None:
 
     # Probe evaluator — uses the held-out probe subjects selected above
     probe_evaluator = None
+    val_loader = None
     if probe_indices:
         probe_subset = torch.utils.data.Subset(dataset, probe_indices)
         probe_loader = DataLoader(
@@ -256,6 +257,9 @@ def main() -> None:
             num_workers=int(cfg.data.num_workers),
             collate_fn=list,
         )
+        # Same held-out subjects drive the per-epoch validation-loss and
+        # representation-health diagnostics.
+        val_loader = probe_loader
         probe_evaluator = ProbeEvaluator(
             loader=probe_loader,
             device=device,
@@ -284,6 +288,8 @@ def main() -> None:
         ctx_var_weight=float(cfg.training.get("ctx_var_weight", 1.0)),
         cov_weight=float(cfg.training.get("cov_weight", 0.1)),
         var_gamma=float(cfg.training.get("var_gamma", 0.1)),
+        val_loader=val_loader,
+        diag_freq=int(cfg.logging.get("diag_freq", 1)),
     )
 
     output_dir = Path(cfg.meta.output_dir)

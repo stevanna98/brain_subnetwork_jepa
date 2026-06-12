@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import logging
 import time
 from pathlib import Path
@@ -18,7 +20,12 @@ try:
 except ImportError:
     _MATPLOTLIB_AVAILABLE = False
 
-from ..evaluation.linear_probe import ProbeEvaluator
+from ..evaluation.diagnostics import (
+    CollapseThresholds,
+    collapse_warnings,
+    representation_health,
+)
+from ..evaluation.linear_probe import ProbeEvaluator, extract_representations
 from ..masking.subnetwork_masking import SubnetworkMaskCollator
 from ..models.bs_jepa import BSJEPA
 from .ema import EMAUpdater
@@ -26,6 +33,25 @@ from .losses import jepa_loss
 from .optim import LinearWDSchedule, WarmupCosineSchedule
 
 logger = logging.getLogger(__name__)
+
+# Column order for the per-epoch CSV/JSONL training log.
+_LOG_FIELDS = [
+    "epoch",
+    "train_loss",
+    "train_sim",
+    "train_ctx_var",
+    "train_hat_var",
+    "train_ctx_cov",
+    "train_tgt_std",
+    "val_jepa_loss",
+    "embedding_std_mean",
+    "embedding_std_min",
+    "mean_pairwise_cosine",
+    "effective_rank",
+    "grad_norm",
+    "lr",
+    "ema_tau",
+]
 
 
 class Trainer:
@@ -48,6 +74,12 @@ class Trainer:
         probe_evaluator: If provided, evaluated every ``probe_freq`` epochs.
         var_weight: Weight for the variance regularization term in the loss.
         var_gamma: Target std for variance regularization.
+        val_loader: Optional held-out loader (lists of PyG Data) used for the
+            validation JEPA loss and representation-health diagnostics. When
+            ``None`` those diagnostics are skipped and training is unchanged.
+        diag_freq: Run validation/representation diagnostics every this many
+            epochs (and on the final epoch). 0 disables them.
+        collapse_thresholds: Thresholds for collapse / gradient warnings.
     """
 
     def __init__(
@@ -66,6 +98,9 @@ class Trainer:
         ctx_var_weight: float = 1.0,
         cov_weight: float = 0.1,
         var_gamma: float = 0.1,
+        val_loader: DataLoader | None = None,
+        diag_freq: int = 1,
+        collapse_thresholds: CollapseThresholds | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -81,6 +116,9 @@ class Trainer:
         self._ctx_var_weight = ctx_var_weight
         self._cov_weight = cov_weight
         self._var_gamma = var_gamma
+        self.val_loader = val_loader
+        self.diag_freq = diag_freq
+        self.collapse_thresholds = collapse_thresholds or CollapseThresholds()
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,20 +142,46 @@ class Trainer:
         if plot_dir:
             plot_dir.mkdir(parents=True, exist_ok=True)
 
+        # CSV/JSONL training log lives next to the checkpoints (falls back to plots).
+        log_dir = checkpoint_dir or plot_dir
+        self._csv_path = (log_dir / "training_log.csv") if log_dir else None
+        self._jsonl_path = (log_dir / "training_log.jsonl") if log_dir else None
+
         epoch_losses: list[float] = []
         epoch_taus: list[float] = []
         probe_history: list[dict] = []  # {epoch, **metrics}
 
         for epoch in range(1, num_epochs + 1):
-            avg_loss = self._train_epoch(loader, epoch)
+            is_last = epoch == num_epochs
+
+            train_metrics = self._train_epoch(loader, epoch)
             tau = self.ema_updater.current_tau
+            avg_loss = train_metrics["train_loss"]
 
             epoch_losses.append(avg_loss)
             epoch_taus.append(tau)
 
-            logger.info("Epoch %d | avg_loss=%.4f | tau=%.5f", epoch, avg_loss, tau)
+            # Assemble the compact per-epoch row.
+            row: dict[str, float] = {"epoch": epoch, **train_metrics, "ema_tau": tau}
 
-            is_last = epoch == num_epochs
+            # Validation JEPA loss + representation-health diagnostics.
+            run_diag = (
+                self.val_loader is not None
+                and self.diag_freq > 0
+                and (epoch % self.diag_freq == 0 or is_last)
+            )
+            if run_diag:
+                row["val_jepa_loss"] = self._compute_val_loss(self.val_loader)
+                row.update(self._run_diagnostics(self.val_loader))
+                self.model.train()  # restore train mode after eval passes
+
+            # Collapse / instability warnings.
+            for msg in collapse_warnings(row, self.collapse_thresholds):
+                logger.warning("Epoch %d | COLLAPSE CHECK: %s", epoch, msg)
+
+            self._write_log_row(row)
+            logger.info("Epoch %d | %s", epoch, json.dumps(self._round_row(row)))
+
             if checkpoint_dir and (epoch % checkpoint_freq == 0 or is_last):
                 self._save_checkpoint(checkpoint_dir / f"ckpt_epoch{epoch:04d}.pt", epoch, avg_loss)
 
@@ -130,10 +194,18 @@ class Trainer:
             if plot_dir:
                 self._save_plots(plot_dir, epoch_losses, epoch_taus, probe_history)
 
-    def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
+    def _train_epoch(self, loader: DataLoader, epoch: int) -> dict[str, float]:
+        """Run one training epoch.
+
+        Returns a dict of epoch-averaged metrics with ``train_``-prefixed loss
+        components plus ``train_loss``, ``grad_norm`` (mean total gradient norm
+        before clipping), and ``lr`` (last LR of the epoch).
+        """
         self.model.train()
         total_loss = 0.0
         running: dict[str, float] = {}
+        grad_norm_sum = 0.0
+        last_lr = 0.0
 
         for itr, raw_batch in enumerate(loader):
             t0 = time.time()
@@ -159,14 +231,16 @@ class Trainer:
 
             # Backward
             loss.backward()
-            if self.clip_grad is not None:
-                params = (
-                    list(self.model.context_encoder.parameters())
-                    + list(self.model.predictor.parameters())
-                )
-                if self.model.feature_extractor is not None:
-                    params += list(self.model.feature_extractor.parameters())
-                nn.utils.clip_grad_norm_(params, self.clip_grad)
+            # Always measure the gradient norm; clip only if requested. A max_norm
+            # of +inf computes (and returns) the total norm without scaling.
+            params = (
+                list(self.model.context_encoder.parameters())
+                + list(self.model.predictor.parameters())
+            )
+            if self.model.feature_extractor is not None:
+                params += list(self.model.feature_extractor.parameters())
+            max_norm = self.clip_grad if self.clip_grad is not None else float("inf")
+            grad_norm = float(nn.utils.clip_grad_norm_(params, max_norm))
             self.optimizer.step()
 
             # Schedules + EMA
@@ -175,6 +249,8 @@ class Trainer:
             tau = self.ema_updater.step(self.model.context_encoder, self.model.target_encoder)
 
             total_loss += loss.item()
+            grad_norm_sum += grad_norm
+            last_lr = lr
             for k, v in metrics.items():
                 running[k] = running.get(k, 0.0) + v.item()
 
@@ -182,14 +258,77 @@ class Trainer:
                 elapsed = time.time() - t0
                 metric_str = " | ".join(f"{k}={v.item():.4f}" for k, v in metrics.items())
                 logger.info(
-                    "Epoch %d | itr %d | loss=%.4f | %s | lr=%.2e | tau=%.5f | %.1f ms",
-                    epoch, itr, loss.item(), metric_str, lr, tau, elapsed * 1000,
+                    "Epoch %d | itr %d | loss=%.4f | %s | grad_norm=%.3f | lr=%.2e | "
+                    "tau=%.5f | %.1f ms",
+                    epoch, itr, loss.item(), metric_str, grad_norm, lr, tau, elapsed * 1000,
                 )
 
         n = max(len(loader), 1)
         avg_str = " | ".join(f"avg_{k}={v / n:.4f}" for k, v in running.items())
         logger.info("Epoch %d done | avg_loss=%.4f | %s", epoch, total_loss / n, avg_str)
-        return total_loss / n
+
+        out = {"train_loss": total_loss / n, "grad_norm": grad_norm_sum / n, "lr": last_lr}
+        out.update({f"train_{k}": v / n for k, v in running.items()})
+        return out
+
+    # ------------------------------------------------------------------
+    # Diagnostics (no optimizer / EMA updates)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _compute_val_loss(self, val_loader: DataLoader) -> float:
+        """Mean JEPA loss over *val_loader* with fresh masks, in eval mode.
+
+        Does not touch the optimizer or EMA. Returns NaN if the loader is empty.
+        """
+        self.model.eval()
+        total = 0.0
+        count = 0
+        for raw_batch in val_loader:
+            batch, masks = self.mask_collator(raw_batch)
+            batch = batch.to(self.device)
+            masks.context_rsn_ids = masks.context_rsn_ids.to(self.device)
+            masks.target_rsn_ids = masks.target_rsn_ids.to(self.device)
+            masks.context_node_masks = [m.to(self.device) for m in masks.context_node_masks]
+            masks.target_node_masks = [m.to(self.device) for m in masks.target_node_masks]
+
+            z_hat, z_tgt, ctx_embs = self.model(batch, masks)
+            loss, _ = jepa_loss(
+                z_hat, z_tgt, ctx_embs,
+                var_weight=self._var_weight,
+                ctx_var_weight=self._ctx_var_weight,
+                cov_weight=self._cov_weight,
+                var_gamma=self._var_gamma,
+            )
+            total += loss.item()
+            count += 1
+        return total / count if count else float("nan")
+
+    @torch.no_grad()
+    def _run_diagnostics(self, val_loader: DataLoader) -> dict[str, float]:
+        """Extract frozen target-encoder embeddings and return health metrics."""
+        features, _ = extract_representations(self.model, val_loader, self.device)
+        return representation_health(features)
+
+    def _round_row(self, row: dict[str, float]) -> dict[str, float]:
+        """Round float values for compact logging."""
+        return {
+            k: (round(v, 5) if isinstance(v, float) else v)
+            for k, v in row.items()
+        }
+
+    def _write_log_row(self, row: dict[str, float]) -> None:
+        """Append one epoch row to the CSV and JSONL logs (if a log dir is set)."""
+        if self._csv_path is not None:
+            write_header = not self._csv_path.exists()
+            with self._csv_path.open("a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=_LOG_FIELDS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, "") for k in _LOG_FIELDS})
+        if self._jsonl_path is not None:
+            with self._jsonl_path.open("a") as fh:
+                fh.write(json.dumps(self._round_row(row)) + "\n")
 
     def _save_plots(
         self,
