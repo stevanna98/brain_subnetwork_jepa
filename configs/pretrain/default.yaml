@@ -9,8 +9,8 @@ data:
   synthetic: false
   num_synthetic_subjects: 64
   # --- features ---
-  node_feature_type: bold  # bold | fc_row | ones
-  feature_mode: conv1d     # passthrough | conv1d  (only used when node_feature_type=bold)
+  node_feature_type: ones  # bold | fc_row | ones
+  feature_mode: passthrough     # passthrough | conv1d  (only used when node_feature_type=bold)
   feature_dim: 64          # (only used when node_feature_type=bold)
   bold_key: BOLD              # key for time-series inside each subject dict (FCDictDataset only)
   fc_key: FC                  # key for FC matrix inside each subject dict (FCDictDataset only)
@@ -37,9 +37,9 @@ model:
   encoder_dropout: 0.0
   pooling_mode: mean          # mean | attention
   region_positional_encoding: false  # learnable embedding per brain region — OFF by default (causes collapse shortcut)
-  predictor_dim: 128
+  predictor_dim: 32       # must be divisible by predictor_heads
   predictor_depth: 6
-  predictor_heads: 6
+  predictor_heads: 8
   predictor_dropout: 0.0
 
 training:

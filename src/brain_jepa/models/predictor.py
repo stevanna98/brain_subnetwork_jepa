@@ -39,6 +39,11 @@ class SubnetworkPredictor(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if predictor_dim % num_heads != 0:
+            raise ValueError(
+                f"predictor_dim ({predictor_dim}) must be divisible by predictor_heads "
+                f"({num_heads}); got remainder {predictor_dim % num_heads}."
+            )
         self.encoder_dim = encoder_dim
         self.predictor_dim = predictor_dim
         self.num_rsns = num_rsns
