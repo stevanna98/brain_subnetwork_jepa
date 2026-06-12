@@ -32,6 +32,14 @@ class MaskOutput:
     context_node_masks: list[torch.Tensor]
     target_node_masks: list[torch.Tensor]
 
+    def to(self, device: torch.device) -> "MaskOutput":
+        """Move all mask tensors to *device* (returns self)."""
+        self.context_rsn_ids = self.context_rsn_ids.to(device)
+        self.target_rsn_ids = self.target_rsn_ids.to(device)
+        self.context_node_masks = [m.to(device) for m in self.context_node_masks]
+        self.target_node_masks = [m.to(device) for m in self.target_node_masks]
+        return self
+
 
 class SubnetworkMaskCollator:
     """Collates a list of PyG :class:`~torch_geometric.data.Data` graphs and

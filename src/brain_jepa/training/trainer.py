@@ -48,6 +48,7 @@ _LOG_FIELDS = [
     "embedding_std_mean",
     "embedding_std_min",
     "mean_pairwise_cosine",
+    "centered_mean_pairwise_cosine",
     "effective_rank",
     "node_embedding_std_mean",
     "within_subject_node_std_mean",
@@ -213,13 +214,12 @@ class Trainer:
         for itr, raw_batch in enumerate(loader):
             t0 = time.time()
 
-            # Collate with masking — raw_batch is a list of PyG Data objects
+            # Collate with masking. Both the static (PyG Batch + MaskOutput) and
+            # spatiotemporal (STBatch + STMaskOutput) collators return objects
+            # exposing .to(device), so the loop stays mode-agnostic.
             batch, masks = self.mask_collator(raw_batch)
             batch = batch.to(self.device)
-            masks.context_rsn_ids = masks.context_rsn_ids.to(self.device)
-            masks.target_rsn_ids = masks.target_rsn_ids.to(self.device)
-            masks.context_node_masks = [m.to(self.device) for m in masks.context_node_masks]
-            masks.target_node_masks = [m.to(self.device) for m in masks.target_node_masks]
+            masks = masks.to(self.device)
 
             # Forward
             self.optimizer.zero_grad()
@@ -236,12 +236,10 @@ class Trainer:
             loss.backward()
             # Always measure the gradient norm; clip only if requested. A max_norm
             # of +inf computes (and returns) the total norm without scaling.
-            params = (
-                list(self.model.context_encoder.parameters())
-                + list(self.model.predictor.parameters())
-            )
-            if self.model.feature_extractor is not None:
-                params += list(self.model.feature_extractor.parameters())
+            # Collect trainable params generically so this works for both the
+            # static and spatiotemporal models (the frozen target encoder, with
+            # requires_grad=False, is excluded automatically).
+            params = [p for p in self.model.parameters() if p.requires_grad]
             max_norm = self.clip_grad if self.clip_grad is not None else float("inf")
             grad_norm = float(nn.utils.clip_grad_norm_(params, max_norm))
             self.optimizer.step()
@@ -290,10 +288,7 @@ class Trainer:
         for raw_batch in val_loader:
             batch, masks = self.mask_collator(raw_batch)
             batch = batch.to(self.device)
-            masks.context_rsn_ids = masks.context_rsn_ids.to(self.device)
-            masks.target_rsn_ids = masks.target_rsn_ids.to(self.device)
-            masks.context_node_masks = [m.to(self.device) for m in masks.context_node_masks]
-            masks.target_node_masks = [m.to(self.device) for m in masks.target_node_masks]
+            masks = masks.to(self.device)
 
             z_hat, z_tgt, ctx_embs = self.model(batch, masks)
             loss, _ = jepa_loss(
@@ -402,6 +397,9 @@ class Trainer:
         plt.close(fig)
 
     def _save_checkpoint(self, path: Path, epoch: int, loss: float) -> None:
+        # Core modules are shared by the static and spatiotemporal models; the
+        # extra feature module is saved under its model-specific key (static:
+        # feature_extractor, spatiotemporal: tokenizer) when present.
         state = {
             "epoch": epoch,
             "loss": loss,
@@ -410,8 +408,12 @@ class Trainer:
             "predictor": self.model.predictor.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
-        if self.model.feature_extractor is not None:
-            state["feature_extractor"] = self.model.feature_extractor.state_dict()
+        feature_extractor = getattr(self.model, "feature_extractor", None)
+        if feature_extractor is not None:
+            state["feature_extractor"] = feature_extractor.state_dict()
+        tokenizer = getattr(self.model, "tokenizer", None)
+        if tokenizer is not None:
+            state["tokenizer"] = tokenizer.state_dict()
         torch.save(state, path)
         logger.info("Checkpoint saved → %s", path)
 

@@ -57,6 +57,10 @@ def representation_health(features: torch.Tensor) -> dict[str, float]:
             dimension shows up here before it moves the mean).
           - ``mean_pairwise_cosine``: mean off-diagonal cosine similarity between
             subject embeddings (→1 → all subjects map to the same direction).
+          - ``centered_mean_pairwise_cosine``: same after subtracting the global
+            mean embedding. This isolates the *residual* — if subjects share a
+            large common component (common in fMRI), ``mean_pairwise_cosine`` can
+            sit near 1 while the centred version reveals real per-subject spread.
           - ``effective_rank``:       effective rank of the embedding matrix.
     """
     features = features.detach().float()
@@ -68,13 +72,25 @@ def representation_health(features: torch.Tensor) -> dict[str, float]:
         "effective_rank": effective_rank(features),
     }
     if n >= 2:
-        normed = F.normalize(features, dim=1)
-        sim = normed @ normed.T
-        off_diag_sum = sim.sum() - torch.diagonal(sim).sum()
-        metrics["mean_pairwise_cosine"] = float(off_diag_sum / (n * (n - 1)))
+        metrics["mean_pairwise_cosine"] = _mean_off_diag_cosine(features)
+        metrics["centered_mean_pairwise_cosine"] = _mean_off_diag_cosine(
+            features - features.mean(dim=0, keepdim=True)
+        )
     else:
         metrics["mean_pairwise_cosine"] = float("nan")
+        metrics["centered_mean_pairwise_cosine"] = float("nan")
     return metrics
+
+
+def _mean_off_diag_cosine(features: torch.Tensor) -> float:
+    """Mean off-diagonal cosine similarity between rows of *features*."""
+    n = features.shape[0]
+    if n < 2:
+        return float("nan")
+    normed = F.normalize(features, dim=1)
+    sim = normed @ normed.T
+    off_diag_sum = sim.sum() - torch.diagonal(sim).sum()
+    return float(off_diag_sum / (n * (n - 1)))
 
 
 @torch.no_grad()

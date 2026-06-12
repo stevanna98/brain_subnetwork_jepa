@@ -28,12 +28,17 @@ from torch.utils.data import DataLoader
 # Allow running from repo root without installing
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from brain_jepa.data import BrainDataset, FCDictDataset, SyntheticBrainDataset
+from brain_jepa.data import (
+    BrainDataset,
+    FCDictDataset,
+    SyntheticBrainDataset,
+    WindowedBOLDDataset,
+)
 from brain_jepa.data.atlas import load_atlas
 from brain_jepa.data.transforms import build_feature_module
 from brain_jepa.evaluation import ProbeEvaluator
-from brain_jepa.masking import SubnetworkMaskCollator
-from brain_jepa.models import build_bsjepa
+from brain_jepa.masking import SpatioTemporalMaskCollator, SubnetworkMaskCollator
+from brain_jepa.models import build_bsjepa, build_st_bsjepa
 from brain_jepa.training import (
     EMAUpdater,
     LinearWDSchedule,
@@ -60,6 +65,141 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _held_out_split(dataset, cfg) -> tuple[list[int], int]:
+    """Pick held-out probe/validation indices; returns (probe_indices, probe_freq)."""
+    probe_cfg = cfg.get("probe", {})
+    probe_freq = int(probe_cfg.get("freq", 10))
+    if probe_freq <= 0:
+        return [], probe_freq
+    requested = int(probe_cfg.get("num_subjects", min(200, len(dataset))))
+    probe_size = min(requested, len(dataset) // 2)
+    g = torch.Generator().manual_seed(int(cfg.meta.seed))
+    return torch.randperm(len(dataset), generator=g)[:probe_size].tolist(), probe_freq
+
+
+def run_spatiotemporal(cfg, atlas, device: torch.device) -> None:
+    """Spatiotemporal BS-JEPA pretraining (model.mode=spatiotemporal)."""
+    if cfg.data.get("synthetic", False):
+        logger.error("Spatiotemporal mode requires a real dict_file (no synthetic path).")
+        sys.exit(1)
+
+    dataset = WindowedBOLDDataset(
+        dict_path=Path(cfg.data.dict_file),
+        atlas=atlas,
+        window_length=int(cfg.data.window_length),
+        window_stride=int(cfg.data.window_stride),
+        drop_last=bool(cfg.data.get("drop_last", True)),
+        pad_last=bool(cfg.data.get("pad_last", False)),
+        bold_key=cfg.data.get("bold_key", "BOLD"),
+        transpose_bold=bool(cfg.data.get("transpose_bold", False)),
+    )
+    logger.info("WindowedBOLDDataset: %d subjects from %s", len(dataset), cfg.data.dict_file)
+
+    mask_collator = SpatioTemporalMaskCollator(
+        num_rsns=atlas.num_rsns,
+        mode=cfg.masking.get("mode", "block"),
+        target_rsn_ratio=float(cfg.masking.get("target_rsn_ratio", 0.5)),
+        target_time_ratio=float(cfg.masking.get("target_time_ratio", 0.5)),
+        num_target_blocks=int(cfg.masking.get("num_target_blocks", 1)),
+        block_time_length=int(cfg.masking.get("block_time_length", 2)),
+        seed=int(cfg.meta.seed),
+    )
+
+    # Held-out subjects for probe + diagnostics.
+    probe_indices, probe_freq = _held_out_split(dataset, cfg)
+    if probe_indices:
+        probe_set = set(probe_indices)
+        train_dataset = torch.utils.data.Subset(
+            dataset, [i for i in range(len(dataset)) if i not in probe_set]
+        )
+        logger.info(
+            "Subject split: %d pretraining / %d probe (held out)",
+            len(train_dataset), len(probe_indices),
+        )
+    else:
+        train_dataset = dataset
+
+    loader = DataLoader(
+        train_dataset,
+        batch_size=int(cfg.data.batch_size),
+        shuffle=True,
+        num_workers=int(cfg.data.num_workers),
+        collate_fn=list,  # Trainer applies the ST mask collator
+        drop_last=True,
+    )
+
+    model = build_st_bsjepa(
+        atlas=atlas,
+        window_length=int(cfg.data.window_length),
+        embed_dim=int(cfg.model.get("st_embed_dim", 256)),
+        feature_mode=cfg.data.get("feature_mode", "conv1d"),
+        time_max_windows=int(cfg.model.get("time_max_windows", 64)),
+        st_encoder_depth=int(cfg.model.get("st_encoder_depth", 4)),
+        st_encoder_heads=int(cfg.model.get("st_encoder_heads", 8)),
+        st_predictor_dim=int(cfg.model.get("st_predictor_dim", 128)),
+        st_predictor_depth=int(cfg.model.get("st_predictor_depth", 4)),
+        st_predictor_heads=int(cfg.model.get("st_predictor_heads", 4)),
+        dropout=float(cfg.model.get("encoder_dropout", 0.0)),
+    ).to(device)
+    logger.info(
+        "ST trainable params: %d",
+        sum(p.numel() for p in model.parameters() if p.requires_grad),
+    )
+
+    iters_per_epoch = len(loader)
+    total_steps = iters_per_epoch * int(cfg.training.num_epochs)
+    warmup_steps = iters_per_epoch * int(cfg.training.warmup_epochs)
+
+    optimizer = build_optimizer(
+        model.tokenizer, model.context_encoder, model.predictor,
+        lr=float(cfg.training.lr),
+        weight_decay=float(cfg.training.weight_decay_start),
+    )
+    lr_scheduler = WarmupCosineSchedule(
+        optimizer, warmup_steps=warmup_steps, start_lr=float(cfg.training.start_lr),
+        ref_lr=float(cfg.training.lr), total_steps=total_steps, final_lr=float(cfg.training.final_lr),
+    )
+    wd_scheduler = LinearWDSchedule(
+        optimizer, wd_start=float(cfg.training.weight_decay_start),
+        wd_end=float(cfg.training.weight_decay_end), total_steps=total_steps,
+    )
+    ema_updater = EMAUpdater(
+        tau_start=float(cfg.training.ema_tau_start),
+        tau_end=float(cfg.training.ema_tau_end), total_steps=total_steps,
+    )
+
+    probe_evaluator = None
+    val_loader = None
+    if probe_indices:
+        probe_loader = DataLoader(
+            torch.utils.data.Subset(dataset, probe_indices),
+            batch_size=int(cfg.data.batch_size),
+            shuffle=False, num_workers=int(cfg.data.num_workers), collate_fn=list,
+        )
+        val_loader = probe_loader
+        probe_evaluator = ProbeEvaluator(loader=probe_loader, device=device, seed=int(cfg.meta.seed))
+
+    trainer = Trainer(
+        model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, wd_scheduler=wd_scheduler,
+        ema_updater=ema_updater, mask_collator=mask_collator, device=device,
+        clip_grad=float(cfg.training.clip_grad) if cfg.training.clip_grad else None,
+        log_freq=int(cfg.logging.log_freq), probe_evaluator=probe_evaluator,
+        var_weight=float(cfg.training.get("var_weight", 0.5)),
+        ctx_var_weight=float(cfg.training.get("ctx_var_weight", 1.0)),
+        cov_weight=float(cfg.training.get("cov_weight", 0.1)),
+        var_gamma=float(cfg.training.get("var_gamma", 0.1)),
+        val_loader=val_loader, diag_freq=int(cfg.logging.get("diag_freq", 1)),
+    )
+
+    output_dir = Path(cfg.meta.output_dir)
+    trainer.train(
+        loader=loader, num_epochs=int(cfg.training.num_epochs), checkpoint_dir=output_dir,
+        checkpoint_freq=int(cfg.logging.checkpoint_freq),
+        plot_dir=Path(cfg.logging.plot_dir) if cfg.logging.get("plot_dir") else None,
+        probe_freq=probe_freq,
+    )
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config, args.overrides)
@@ -74,6 +214,11 @@ def main() -> None:
     atlas_csv = Path(cfg.data.atlas_csv)
     atlas = load_atlas(atlas_csv)
     logger.info("Atlas: %d regions, %d RSNs", atlas.num_regions, atlas.num_rsns)
+
+    # Spatiotemporal path is fully separate; static path continues below.
+    if cfg.model.get("mode", "static") == "spatiotemporal":
+        run_spatiotemporal(cfg, atlas, device)
+        return
 
     # Dataset
     node_feature_type = cfg.data.get("node_feature_type", "bold")
